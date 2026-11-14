@@ -1,0 +1,6 @@
+{
+  "name": "TriLine Studio",
+  "description": "Three-line language-learning subtitle generator with base translation, target dialogue, intuitive English phonetics, dual-file alignment, and styled SRT/ASS export.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
