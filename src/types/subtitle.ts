@@ -212,16 +212,66 @@ export interface TmdbSearchItem {
   voteAverage: number;
 }
 
+export type SubtitleProviderId = 'opensubtitles' | 'subdl';
+
 export interface ProviderSubtitleItem {
   id: string;
-  provider: 'opensubtitles' | 'subdl';
+  provider: SubtitleProviderId;
+  providerLabel: string;
+  title: string;
   fileName: string;
   language: string;
+  mediaInfo?: string;
+  season?: number;
+  episode?: number;
   release: string;
+  releaseYear?: string;
+  format: string;
+  downloadable: boolean;
   downloadCount?: number;
-  hearingImpaired?: boolean;
-  format?: string;
+  hearingImpaired: boolean;
   downloadRef: string;
+  alsoOnProviders?: SubtitleProviderId[];
+}
+
+export type ProviderErrorCode =
+  | 'unconfigured'
+  | 'auth'
+  | 'rate_limit'
+  | 'timeout'
+  | 'upstream'
+  | 'network';
+
+export interface ProviderSearchOutcome {
+  provider: SubtitleProviderId;
+  providerLabel: string;
+  configured: boolean;
+  ok: boolean;
+  results: ProviderSubtitleItem[];
+  message?: string;
+  error?: string;
+  errorCode?: ProviderErrorCode;
+}
+
+export interface MultiProviderSearchResponse {
+  opensubtitles?: ProviderSearchOutcome;
+  subdl?: ProviderSearchOutcome;
+  duplicatesRemoved: number;
+}
+
+export type IntegrationProviderId = 'gemini' | 'tmdb' | 'opensubtitles' | 'subdl';
+
+export type VerificationStatus = 'unconfigured' | 'untested' | 'verified' | 'failed';
+
+export interface ProviderDiagnostic {
+  provider: IntegrationProviderId;
+  name: string;
+  configured: boolean;
+  authMode: string;
+  verificationStatus: VerificationStatus;
+  lastCheckedAt: string | null;
+  lastSuccessAt: string | null;
+  error: string | null;
 }
 
 export interface IntegrationsStatus {
@@ -229,6 +279,7 @@ export interface IntegrationsStatus {
   tmdb: boolean;
   opensubtitles: boolean;
   subdl: boolean;
+  tmdbAuthMode?: 'bearer_token' | 'v3_api_key' | 'none';
 }
 
 export const SUPPORTED_LANGUAGES = [

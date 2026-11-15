@@ -12,11 +12,13 @@ import {
   type AssStyleConfig,
   type ConversionJob,
   type ConversionMode,
+  type IntegrationProviderId,
   type MovieMetadata,
   type ParsedSubtitleResult,
   type PhoneticStyle,
   type ProcessingOptions,
   type SavedProject,
+  type SubtitleProviderId,
   type TriLineCue,
 } from './src/types/subtitle.ts';
 import { parseSubtitleBuffer } from './server/subtitles/parser.ts';
@@ -39,10 +41,13 @@ import { processTriLineConversion, type BatchInputCue } from './server/ai/transl
 import {
   downloadOpenSubtitleFile,
   downloadSubdlFile,
+  getIntegrationsDiagnostics,
   getIntegrationsStatus,
-  searchOpenSubtitles,
-  searchSubdl,
+  ProviderRequestError,
+  sanitizeProviderMessage,
+  searchAllSubtitleProviders,
   searchTmdb,
+  verifyProviderConnection,
 } from './server/providers/integrations.ts';
 
 const PORT = Number(process.env.PORT) || 3000;
@@ -98,8 +103,33 @@ async function startServer() {
 
   app.get('/api/integrations/status', async (_req, res) => {
     const status = getIntegrationsStatus();
+    const diagnostics = getIntegrationsDiagnostics();
     const cacheStats = await getCacheStats();
-    res.json({ status, cacheStats });
+    res.json({ status, diagnostics, cacheStats });
+  });
+
+  app.post('/api/integrations/test', async (req, res) => {
+    const { provider } = (req.body || {}) as {
+      provider?: IntegrationProviderId | 'all';
+    };
+    const validProviders: IntegrationProviderId[] = [
+      'gemini',
+      'tmdb',
+      'opensubtitles',
+      'subdl',
+    ];
+    if (provider && provider !== 'all' && !validProviders.includes(provider)) {
+      return res.status(400).json({ error: 'Unknown integration provider.' });
+    }
+
+    const targets =
+      !provider || provider === 'all' ? validProviders : [provider];
+
+    await Promise.allSettled(targets.map((p) => verifyProviderConnection(p)));
+    res.json({
+      status: getIntegrationsStatus(),
+      diagnostics: getIntegrationsDiagnostics(),
+    });
   });
 
   // TMDB Search
@@ -112,35 +142,58 @@ async function startServer() {
       const result = await searchTmdb(query);
       res.json(result);
     } catch (error: unknown) {
-      const message = error instanceof Error ? error.message : 'TMDB search failed.';
+      if (error instanceof ProviderRequestError) {
+        const httpStatus =
+          error.errorCode === 'rate_limit'
+            ? 429
+            : error.errorCode === 'timeout'
+              ? 504
+              : 502;
+        return res.status(httpStatus).json({
+          error: error.message,
+          errorCode: error.errorCode,
+        });
+      }
+      const message = sanitizeProviderMessage(
+        error instanceof Error ? error.message : 'TMDB search failed.',
+      );
       res.status(502).json({ error: message });
     }
   });
 
-  // Subtitle Providers Search (OpenSubtitles + Subdl)
+  // Subtitle Providers Search (OpenSubtitles + SubDL) — concurrent & fault-isolated
   app.get('/api/subtitles/provider-search', async (req, res) => {
     const query = String(req.query.query || '').trim();
     const tmdbId = req.query.tmdbId ? String(req.query.tmdbId) : undefined;
     const language = req.query.language ? String(req.query.language) : undefined;
-    const provider = String(req.query.provider || 'all');
+    const rawProvider = String(req.query.provider || 'all');
+
+    if (
+      rawProvider !== 'all' &&
+      rawProvider !== 'opensubtitles' &&
+      rawProvider !== 'subdl'
+    ) {
+      return res.status(400).json({ error: 'Invalid subtitle provider filter.' });
+    }
+
+    if (!query && !tmdbId) {
+      return res
+        .status(400)
+        .json({ error: 'Provide a search title query or TMDB ID.' });
+    }
 
     try {
-      const out: {
-        opensubtitles?: Awaited<ReturnType<typeof searchOpenSubtitles>>;
-        subdl?: Awaited<ReturnType<typeof searchSubdl>>;
-      } = {};
-
-      if (provider === 'all' || provider === 'opensubtitles') {
-        out.opensubtitles = await searchOpenSubtitles({ query, tmdbId, language });
-      }
-      if (provider === 'all' || provider === 'subdl') {
-        out.subdl = await searchSubdl({ query, tmdbId, language });
-      }
-
+      const out = await searchAllSubtitleProviders({
+        query,
+        tmdbId,
+        language,
+        provider: rawProvider as 'all' | SubtitleProviderId,
+      });
       res.json(out);
     } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : 'Provider subtitle search failed.';
+      const message = sanitizeProviderMessage(
+        error instanceof Error ? error.message : 'Provider subtitle search failed.',
+      );
       res.status(502).json({ error: message });
     }
   });
@@ -169,13 +222,34 @@ async function startServer() {
         options || DEFAULT_PROCESSING_OPTIONS,
       );
 
+      if (parsed.cues.length === 0) {
+        return res.status(422).json({
+          error: 'Downloaded subtitle file contained no readable subtitle cues.',
+        });
+      }
+
       res.json({
         parsed,
         rawBase64: downloaded.buffer.toString('base64'),
       });
     } catch (error: unknown) {
-      const message =
-        error instanceof Error ? error.message : 'Failed to download provider subtitle.';
+      if (error instanceof ProviderRequestError) {
+        const httpStatus =
+          error.errorCode === 'rate_limit'
+            ? 429
+            : error.errorCode === 'timeout'
+              ? 504
+              : error.statusCode === 400
+                ? 400
+                : 502;
+        return res.status(httpStatus).json({
+          error: error.message,
+          errorCode: error.errorCode,
+        });
+      }
+      const message = sanitizeProviderMessage(
+        error instanceof Error ? error.message : 'Failed to download provider subtitle.',
+      );
       res.status(502).json({ error: message });
     }
   });

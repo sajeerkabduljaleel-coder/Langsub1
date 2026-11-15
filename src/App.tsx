@@ -17,11 +17,13 @@ import {
   type AssStyleConfig,
   type ConversionJob,
   type ConversionMode,
+  type IntegrationProviderId,
   type IntegrationsStatus,
   type MovieMetadata,
   type ParsedSubtitleResult,
   type PhoneticStyle,
   type ProcessingOptions,
+  type ProviderDiagnostic,
   type SavedProject,
   type TriLineCue,
 } from './types/subtitle';
@@ -32,8 +34,9 @@ import { CueEditorTable } from './components/CueEditorTable';
 import { StyleExportPanel } from './components/StyleExportPanel';
 import { MovieSearchView } from './components/MovieSearchView';
 import { LibraryView, type ProjectSummary } from './components/LibraryView';
+import { SettingsView } from './components/SettingsView';
 
-type ActiveTab = 'generator' | 'search' | 'library' | 'export';
+type ActiveTab = 'generator' | 'search' | 'library' | 'export' | 'settings';
 
 function triggerBlobDownload(blob: Blob, filename: string) {
   const url = URL.createObjectURL(blob);
@@ -56,6 +59,8 @@ export default function App() {
     opensubtitles: false,
     subdl: false,
   });
+  const [diagnostics, setDiagnostics] = useState<ProviderDiagnostic[]>([]);
+  const [testingProviders, setTestingProviders] = useState<Record<string, boolean>>({});
   const [cachedLineCount, setCachedLineCount] = useState(0);
   const [savedProjects, setSavedProjects] = useState<ProjectSummary[]>([]);
   const [isLoadingLibrary, setIsLoadingLibrary] = useState(false);
@@ -101,6 +106,7 @@ export default function App() {
       if (statusRes.ok) {
         const sData = await statusRes.json();
         setIntegrations(sData.status);
+        setDiagnostics(sData.diagnostics || []);
         setCachedLineCount(sData.cacheStats?.cachedLineCount || 0);
       }
       if (projRes.ok) {
@@ -117,6 +123,26 @@ export default function App() {
   useEffect(() => {
     void fetchIntegrationsAndLibrary();
   }, [fetchIntegrationsAndLibrary]);
+
+  const handleTestConnection = async (provider: IntegrationProviderId | 'all') => {
+    setTestingProviders((prev) => ({ ...prev, [provider]: true }));
+    setErrorMsg(null);
+    try {
+      const res = await fetch('/api/integrations/test', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ provider }),
+      });
+      const data = await res.json();
+      if (!res.ok) throw new Error(data.error || 'Connection test failed.');
+      if (data.status) setIntegrations(data.status);
+      if (data.diagnostics) setDiagnostics(data.diagnostics);
+    } catch (err: unknown) {
+      setErrorMsg(err instanceof Error ? err.message : 'Integration test failed.');
+    } finally {
+      setTestingProviders((prev) => ({ ...prev, [provider]: false }));
+    }
+  };
 
   const parseFileSlot = async (
     fileOrPayload: File | { rawText: string; fileName: string } | { rawBase64: string; fileName: string },
@@ -505,7 +531,7 @@ export default function App() {
             TriLine Studio
           </button>
 
-          {/* Zone 2: 4 concise single-line text nav links */}
+          {/* Zone 2: concise single-line text nav links */}
           <nav className="hidden md:flex items-center gap-7 text-sm font-medium">
             {(
               [
@@ -513,6 +539,7 @@ export default function App() {
                 { id: 'search', label: 'Movie Search' },
                 { id: 'library', label: 'Saved Library' },
                 { id: 'export', label: 'Export & Style' },
+                { id: 'settings', label: 'Settings' },
               ] as Array<{ id: ActiveTab; label: string }>
             ).map((nav) => (
               <button
@@ -558,6 +585,7 @@ export default function App() {
               { id: 'search', label: 'Movie Search' },
               { id: 'library', label: 'Library' },
               { id: 'export', label: 'Export & Style' },
+              { id: 'settings', label: 'Settings' },
             ] as Array<{ id: ActiveTab; label: string }>
           ).map((nav) => (
             <button
@@ -1045,6 +1073,7 @@ export default function App() {
         {activeTab === 'search' && (
           <MovieSearchView
             integrations={integrations}
+            diagnostics={diagnostics}
             processingOptions={processingOptions}
             onImportSubtitle={({ parsed, rawBase64, slot, movieMetadata: meta }) => {
               setAlignmentPreview(null);
@@ -1061,6 +1090,7 @@ export default function App() {
               setActiveTab('generator');
             }}
             onGoToUpload={() => setActiveTab('generator')}
+            onGoToSettings={() => setActiveTab('settings')}
           />
         )}
 
@@ -1117,6 +1147,16 @@ export default function App() {
               )}
             </div>
           </div>
+        )}
+
+        {activeTab === 'settings' && (
+          <SettingsView
+            diagnostics={diagnostics}
+            testingProviders={testingProviders}
+            onTestConnection={(provider) => void handleTestConnection(provider)}
+            savedProjectCount={savedProjects.length}
+            cachedLineCount={cachedLineCount}
+          />
         )}
       </main>
     </div>
