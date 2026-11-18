@@ -19,11 +19,16 @@ import {
   type ProcessingOptions,
   type SavedProject,
   type SubtitleProviderId,
+  type TranslationStyle,
   type TriLineCue,
 } from './src/types/subtitle.ts';
 import { parseSubtitleBuffer } from './server/subtitles/parser.ts';
 import { alignDualSubtitles } from './server/subtitles/aligner.ts';
-import { generateAssContent, generateSrtContent } from './server/subtitles/exporter.ts';
+import {
+  generateAssContent,
+  generateSrtContent,
+  generateVttContent,
+} from './server/subtitles/exporter.ts';
 import {
   buildProjectCacheKey,
   deleteProject,
@@ -323,6 +328,7 @@ async function startServer() {
         baseLang,
         targetLang,
         phoneticStyle,
+        translationStyle: rawTranslationStyle,
         processingOptions,
         styleConfig,
         primaryParsed,
@@ -336,6 +342,7 @@ async function startServer() {
         baseLang: string;
         targetLang: string;
         phoneticStyle: PhoneticStyle;
+        translationStyle?: TranslationStyle;
         processingOptions: ProcessingOptions;
         styleConfig?: AssStyleConfig;
         primaryParsed: ParsedSubtitleResult;
@@ -345,6 +352,17 @@ async function startServer() {
         movieMetadata?: MovieMetadata;
         forceRegenerate?: boolean;
       };
+
+      const validTranslationStyles: TranslationStyle[] = [
+        'natural',
+        'literal',
+        'colloquial',
+        'formal',
+      ];
+      const translationStyle: TranslationStyle =
+        rawTranslationStyle && validTranslationStyles.includes(rawTranslationStyle)
+          ? rawTranslationStyle
+          : 'natural';
 
       if (!primaryParsed?.cues?.length) {
         return res.status(400).json({ error: 'Primary subtitle cues are required.' });
@@ -381,6 +399,7 @@ async function startServer() {
         targetLang,
         mode,
         phoneticStyle,
+        translationStyle,
         processingOptions: processingOptions || DEFAULT_PROCESSING_OPTIONS,
         alignmentOverridesHash,
       });
@@ -397,6 +416,7 @@ async function startServer() {
             baseLang,
             targetLang,
             phoneticStyle,
+            translationStyle,
             totalCues: cachedProject.cues.length,
             processedCues: cachedProject.cues.length,
             cacheHits: cachedProject.cues.length,
@@ -489,6 +509,7 @@ async function startServer() {
         baseLang,
         targetLang,
         phoneticStyle,
+        translationStyle,
         totalCues: inputCues.length,
         processedCues: 0,
         cacheHits: 0,
@@ -508,6 +529,7 @@ async function startServer() {
             baseLang,
             targetLang,
             phoneticStyle,
+            translationStyle,
             skipLineCache: Boolean(forceRegenerate),
             onProgress: (progress) => {
               const current = jobs.get(jobId);
@@ -541,6 +563,7 @@ async function startServer() {
             targetLang,
             mode,
             phoneticStyle,
+            translationStyle,
             sourceFileName: primaryParsed.fileName,
             sourceFormat: primaryParsed.report.originalFormat,
             createdAt: now,
@@ -715,6 +738,22 @@ async function startServer() {
     const safeName = (fileName || 'triline_subtitles').replace(/[^a-zA-Z0-9._-]/g, '_');
     res.setHeader('Content-Type', 'text/plain; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}.triline.ass"`);
+    res.send(content);
+  });
+
+  app.post('/api/export/vtt', (req, res) => {
+    const { cues, styleConfig, fileName } = req.body as {
+      cues?: TriLineCue[];
+      styleConfig?: AssStyleConfig;
+      fileName?: string;
+    };
+    if (!cues?.length) {
+      return res.status(400).json({ error: 'Cues are required for export.' });
+    }
+    const content = generateVttContent(cues, styleConfig || DEFAULT_STYLE_CONFIG);
+    const safeName = (fileName || 'triline_subtitles').replace(/[^a-zA-Z0-9._-]/g, '_');
+    res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
+    res.setHeader('Content-Disposition', `attachment; filename="${safeName}.triline.vtt"`);
     res.send(content);
   });
 

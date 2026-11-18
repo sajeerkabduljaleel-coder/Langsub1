@@ -258,15 +258,25 @@ export function alignDualSubtitles(
   const uncertainThreshold = options.uncertainThreshold ?? 0.65;
 
   const estimatedOffsetMs = estimateGlobalOffsetMs(targetCues, baseCues);
-  const shiftedBase: ShiftedBaseCue[] = baseCues.map((b, bIdx) => {
-    const shiftedStart = Math.max(0, b.startMs + estimatedOffsetMs);
-    const shiftedEnd = Math.max(shiftedStart + 200, b.endMs + estimatedOffsetMs);
-    return {
-      ...b,
-      bIdx,
-      shiftedStart,
-      shiftedEnd,
-    };
+  const shiftedBase: ShiftedBaseCue[] = baseCues
+    .map((b, bIdx) => {
+      const shiftedStart = Math.max(0, b.startMs + estimatedOffsetMs);
+      const shiftedEnd =
+        b.endMs > b.startMs
+          ? Math.max(shiftedStart + 1, b.endMs + estimatedOffsetMs)
+          : shiftedStart + 200;
+      return {
+        ...b,
+        bIdx,
+        shiftedStart,
+        shiftedEnd,
+      };
+    })
+    .sort((a, b) => a.shiftedStart - b.shiftedStart || a.shiftedEnd - b.shiftedEnd);
+
+  // Re-index bIdx after chronological sort so consecutive run checks remain strictly chronological
+  shiftedBase.forEach((b, idx) => {
+    b.bIdx = idx;
   });
 
   const assignments: TargetAssignment[] = [];
@@ -276,7 +286,7 @@ export function alignDualSubtitles(
   for (let tIdx = 0; tIdx < targetCues.length; tIdx++) {
     const t = targetCues[tIdx];
     const tMid = (t.startMs + t.endMs) / 2;
-    const tDur = Math.max(200, t.endMs - t.startMs);
+    const tDur = Math.max(100, t.endMs - t.startMs);
 
     while (
       baseCursor < shiftedBase.length - 1 &&
@@ -293,7 +303,7 @@ export function alignDualSubtitles(
       targetCov: number;
     }> = [];
 
-    for (let bIdx = Math.max(0, baseCursor - 3); bIdx < shiftedBase.length; bIdx++) {
+    for (let bIdx = Math.max(0, baseCursor - 6); bIdx < shiftedBase.length; bIdx++) {
       const b = shiftedBase[bIdx];
       if (b.shiftedStart > t.endMs + 3000) break;
 
@@ -581,6 +591,13 @@ export function alignDualSubtitles(
         )
       : 0;
 
+  let overlappingCues = 0;
+  for (let i = 1; i < aligned.length; i++) {
+    if (aligned[i].startMs < aligned[i - 1].endMs) {
+      overlappingCues++;
+    }
+  }
+
   const stats: AlignmentStats = {
     exactMatches,
     interpolatedMatches,
@@ -591,11 +608,88 @@ export function alignDualSubtitles(
     uncertainCount,
     averageConfidence,
     estimatedOffsetMs,
+    overlappingCues,
   };
 
   return {
     aligned,
     unmatchedBaseCues,
     stats,
+  };
+}
+
+export interface SentenceContinuationHint {
+  index: number;
+  continuesFromPrev: boolean;
+  continuesToNext: boolean;
+}
+
+const TERMINAL_PUNCTUATION_REGEX = /[.!?…。！？»"')\]—]$/;
+
+/**
+ * Identifies dialogue sentences split across consecutive cues so translation can
+ * treat multi-cue sentences coherently without breaking per-cue timestamps.
+ */
+export function annotateSplitSentences(
+  cues: Array<{ index: number; startMs: number; endMs: number; text: string }>,
+): SentenceContinuationHint[] {
+  return cues.map((cue, idx) => {
+    const trimmed = cue.text.trim();
+    const prev = idx > 0 ? cues[idx - 1] : null;
+    const next = idx + 1 < cues.length ? cues[idx + 1] : null;
+
+    const prevContinues =
+      Boolean(prev) &&
+      cue.startMs - prev!.endMs <= 2500 &&
+      prev!.text.trim().length > 0 &&
+      !TERMINAL_PUNCTUATION_REGEX.test(prev!.text.trim());
+
+    const nextContinues =
+      Boolean(next) &&
+      next!.startMs - cue.endMs <= 2500 &&
+      trimmed.length > 0 &&
+      !TERMINAL_PUNCTUATION_REGEX.test(trimmed);
+
+    return {
+      index: cue.index,
+      continuesFromPrev: prevContinues,
+      continuesToNext: nextContinues,
+    };
+  });
+}
+
+export interface AlignmentAuditSummary {
+  totalCues: number;
+  overlappingCount: number;
+  uncertainCount: number;
+  unmatchedTargetCount: number;
+  unmatchedBaseCount: number;
+  duplicateAdjacentCount: number;
+}
+
+export function auditAlignedCues(aligned: AlignedCuePair[]): AlignmentAuditSummary {
+  let overlappingCount = 0;
+  let duplicateAdjacentCount = 0;
+
+  for (let i = 1; i < aligned.length; i++) {
+    const prev = aligned[i - 1];
+    const curr = aligned[i];
+    if (curr.startMs < prev.endMs) {
+      overlappingCount++;
+    }
+    const prevNorm = (prev.targetText || prev.baseText).trim().toLowerCase().replace(/\s+/g, ' ');
+    const currNorm = (curr.targetText || curr.baseText).trim().toLowerCase().replace(/\s+/g, ' ');
+    if (prevNorm && currNorm && prevNorm === currNorm && curr.startMs - prev.endMs <= 500) {
+      duplicateAdjacentCount++;
+    }
+  }
+
+  return {
+    totalCues: aligned.length,
+    overlappingCount,
+    uncertainCount: aligned.filter((a) => a.uncertain).length,
+    unmatchedTargetCount: aligned.filter((a) => a.relationship === 'unmatched-target').length,
+    unmatchedBaseCount: aligned.filter((a) => a.relationship === 'unmatched-base').length,
+    duplicateAdjacentCount,
   };
 }

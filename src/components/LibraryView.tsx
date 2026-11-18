@@ -27,7 +27,7 @@ interface LibraryViewProps {
   isLoading: boolean;
   onOpenProject: (id: string) => void;
   onDeleteProject: (id: string) => void;
-  onExportProject: (id: string, format: 'srt' | 'ass') => void;
+  onExportProject: (id: string, format: 'srt' | 'ass' | 'vtt') => void;
   onGoToGenerator: () => void;
 }
 
@@ -172,6 +172,14 @@ export function LibraryView({
                 >
                   <Download className="w-3.5 h-3.5" />
                   .SRT
+                </button>
+                <button
+                  type="button"
+                  onClick={() => onExportProject(proj.id, 'vtt')}
+                  className="inline-flex items-center gap-1 px-2.5 py-1.5 text-xs font-medium text-slate-700 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors whitespace-nowrap cursor-pointer"
+                >
+                  <Download className="w-3.5 h-3.5" />
+                  .VTT
                 </button>
                 <button
                   type="button"

@@ -128,7 +128,8 @@ function stripFormattingTags(input: string, preserveTags: boolean): string {
   let out = input
     .replace(/\{\\[^}]*\}/g, '') // ASS override tags like {\an8}, {\i1}, {\pos(x,y)}
     .replace(/\\N|\\n/g, '\n')
-    .replace(/\\h/g, ' ');
+    .replace(/\\h/g, ' ')
+    .replace(/<br\s*\/?>/gi, '\n');
 
   if (!preserveTags) {
     out = out
@@ -276,7 +277,7 @@ function parseSrtOrVtt(content: string, format: 'srt' | 'vtt'): RawCue[] {
     cues.push({
       index: seq++,
       startMs,
-      endMs: Math.max(endMs, startMs + 200),
+      endMs: endMs > startMs ? endMs : startMs + 200,
       text: rawText,
       originalText: rawText,
     });
@@ -336,7 +337,7 @@ function parseAss(content: string): RawCue[] {
       cues.push({
         index: seq++,
         startMs,
-        endMs: Math.max(endMs, startMs + 200),
+        endMs: endMs > startMs ? endMs : startMs + 200,
         text: rawText,
         originalText: rawText,
       });
@@ -422,6 +423,13 @@ export function parseSubtitleBuffer(
     cue.index = i + 1;
   });
 
+  let overlappingCueCount = 0;
+  for (let i = 1; i < processed.length; i++) {
+    if (processed[i].startMs < processed[i - 1].endMs) {
+      overlappingCueCount++;
+    }
+  }
+
   const sourceHash = crypto.createHash('sha256').update(buffer).digest('hex').slice(0, 16);
 
   const report: ProcessingReport = {
@@ -432,6 +440,7 @@ export function parseSubtitleBuffer(
     duplicatesRemovedCount,
     mergedLineCount,
     finalCueCount: processed.length,
+    overlappingCueCount,
     sdhRemovedSamples,
   };
 

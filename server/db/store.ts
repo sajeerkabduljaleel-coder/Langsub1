@@ -8,11 +8,12 @@ import type {
   PhoneticStyle,
   ProcessingOptions,
   SavedProject,
+  TranslationStyle,
   TriLineCue,
 } from '../../src/types/subtitle.ts';
 
 export const DEFAULT_GEMINI_MODEL = 'gemini-4-hydrogen';
-export const DEFAULT_PROMPT_VERSION = 'v2';
+export const DEFAULT_PROMPT_VERSION = 'v3';
 
 export interface LineCacheEntry {
   baseText: string;
@@ -142,6 +143,7 @@ export function buildProjectCacheKey(params: {
   targetLang: string;
   mode: ConversionMode;
   phoneticStyle: PhoneticStyle;
+  translationStyle?: TranslationStyle;
   processingOptions: ProcessingOptions;
   model?: string;
   promptVersion?: string;
@@ -155,6 +157,7 @@ export function buildProjectCacheKey(params: {
     targetLang: params.targetLang,
     mode: params.mode,
     phoneticStyle: params.phoneticStyle,
+    translationStyle: params.translationStyle || 'natural',
     processingOptions: params.processingOptions,
     model: params.model || DEFAULT_GEMINI_MODEL,
     promptVersion: params.promptVersion || DEFAULT_PROMPT_VERSION,
@@ -168,6 +171,7 @@ export function buildLineCacheKey(params: {
   baseLang: string;
   targetLang: string;
   phoneticStyle: PhoneticStyle;
+  translationStyle?: TranslationStyle;
   sourcePrimary: string;
   sourceSecondary?: string;
   model?: string;
@@ -180,6 +184,7 @@ export function buildLineCacheKey(params: {
     baseLang: params.baseLang,
     targetLang: params.targetLang,
     phoneticStyle: params.phoneticStyle,
+    translationStyle: params.translationStyle || 'natural',
     sourcePrimary: normA,
     sourceSecondary: normB,
     model: params.model || DEFAULT_GEMINI_MODEL,

@@ -11,6 +11,7 @@ interface StyleExportPanelProps {
   onChangeStyle: (next: AssStyleConfig) => void;
   cues: TriLineCue[];
   onDownloadSrt: () => void;
+  onDownloadVtt?: () => void;
   onDownloadAss: () => void;
   isExporting: boolean;
 }
@@ -26,6 +27,7 @@ export function StyleExportPanel({
   onChangeStyle,
   cues,
   onDownloadSrt,
+  onDownloadVtt,
   onDownloadAss,
   isExporting,
 }: StyleExportPanelProps) {
@@ -70,6 +72,18 @@ export function StyleExportPanel({
             <Download className="w-3.5 h-3.5" />
             Download .SRT
           </button>
+
+          {onDownloadVtt && (
+            <button
+              type="button"
+              disabled={cues.length === 0 || isExporting}
+              onClick={onDownloadVtt}
+              className="inline-flex items-center gap-1.5 px-4 py-2 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg disabled:opacity-40 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
+            >
+              <Download className="w-3.5 h-3.5" />
+              Download .VTT
+            </button>
+          )}
 
           <button
             type="button"

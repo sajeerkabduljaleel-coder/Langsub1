@@ -2,7 +2,29 @@ export type SubtitleFormat = 'srt' | 'vtt' | 'ass';
 
 export type ConversionMode = 'target-first' | 'base-first' | 'dual-merge';
 
-export type PhoneticStyle = 'hyphenated' | 'flowing';
+export type PhoneticStyle = 'hyphenated' | 'flowing' | 'standard';
+
+export type TranslationStyle = 'natural' | 'literal' | 'colloquial' | 'formal';
+
+export interface LearningControlsConfig {
+  showBase: boolean;
+  showTarget: boolean;
+  showPhonetic: boolean;
+  highlightWords: boolean;
+  playbackSpeed: number;
+  pauseBetweenCuesMs: number;
+  repeatCurrentCue: boolean;
+}
+
+export const DEFAULT_LEARNING_CONTROLS: LearningControlsConfig = {
+  showBase: true,
+  showTarget: true,
+  showPhonetic: true,
+  highlightWords: false,
+  playbackSpeed: 1,
+  pauseBetweenCuesMs: 0,
+  repeatCurrentCue: false,
+};
 
 export interface ProcessingOptions {
   removeSdh: boolean;
@@ -101,6 +123,7 @@ export interface AlignmentStats {
   uncertainCount: number;
   averageConfidence: number;
   estimatedOffsetMs: number;
+  overlappingCues?: number;
 }
 
 export interface AlignedCuePair {
@@ -140,6 +163,7 @@ export interface ProcessingReport {
   duplicatesRemovedCount: number;
   mergedLineCount: number;
   finalCueCount: number;
+  overlappingCueCount?: number;
   sdhRemovedSamples: string[];
   alignmentStats?: AlignmentStats;
 }
@@ -158,6 +182,7 @@ export interface ConversionJob {
   baseLang: string;
   targetLang: string;
   phoneticStyle: PhoneticStyle;
+  translationStyle?: TranslationStyle;
   totalCues: number;
   processedCues: number;
   cacheHits: number;
@@ -191,6 +216,7 @@ export interface SavedProject {
   targetLang: string;
   mode: ConversionMode;
   phoneticStyle: PhoneticStyle;
+  translationStyle?: TranslationStyle;
   sourceFileName: string;
   sourceFormat: SubtitleFormat;
   createdAt: string;

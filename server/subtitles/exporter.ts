@@ -21,6 +21,15 @@ export function formatSrtTime(ms: number): string {
   return `${pad2(hours)}:${pad2(mins)}:${pad2(secs)},${pad3(millis)}`;
 }
 
+export function formatVttTime(ms: number): string {
+  const clamped = Math.max(0, Math.round(ms));
+  const hours = Math.floor(clamped / 3600000);
+  const mins = Math.floor((clamped % 3600000) / 60000);
+  const secs = Math.floor((clamped % 60000) / 1000);
+  const millis = clamped % 1000;
+  return `${pad2(hours)}:${pad2(mins)}:${pad2(secs)}.${pad3(millis)}`;
+}
+
 export function formatAssTime(ms: number): string {
   const clamped = Math.max(0, Math.round(ms));
   const hours = Math.floor(clamped / 3600000);
@@ -101,6 +110,23 @@ export function generateSrtContent(cues: TriLineCue[], style: AssStyleConfig): s
 
   const body = blocks.join('\n\n') + '\n';
   return style.srtIncludeBom ? `\uFEFF${body}` : body;
+}
+
+export function generateVttContent(cues: TriLineCue[], style: AssStyleConfig): string {
+  const blocks = cues.map((cue, idx) => {
+    const start = formatVttTime(cue.startMs);
+    const end = formatVttTime(cue.endMs);
+    const lines = style.lineOrder
+      .map((role) => {
+        const text = getLineValue(cue, role).replace(/\r?\n/g, ' ').replace(/\s{2,}/g, ' ').trim();
+        return text || null;
+      })
+      .filter((l): l is string => Boolean(l));
+
+    return `${idx + 1}\n${start} --> ${end}\n${lines.join('\n')}`;
+  });
+
+  return `WEBVTT\n\n${blocks.join('\n\n')}\n`;
 }
 
 export function generateAssContent(

@@ -9,15 +9,16 @@ TriLine Studio converts single or dual movie/TV subtitle files (`.srt`, `.vtt`, 
 ## Architecture
 
 - **Frontend (`src/`)**: React 19 + TypeScript + Tailwind CSS v4 SPA served via Vite middleware in development and static `dist/` in production.
-  - `Generator`: Three conversion modes (`target-first`, `base-first`, `dual-merge`), encoding-aware parsing diagnostics, interactive `AlignmentInspector`, 16:9 `CinemaPreview`, and inline `CueEditorTable`.
+  - `Generator`: Three conversion modes (`target-first`, `base-first`, `dual-merge`), configurable translation styles (`natural`, `literal`, `colloquial`, `formal`), phonetic conventions (`hyphenated`, `flowing`, `standard` Romanization), encoding-aware parsing diagnostics, interactive `AlignmentInspector`, 16:9 `CinemaPreview` with collapsible `Learning Controls` (line toggles, word-level highlighting, playback speed, inter-cue pause, cue repeat/replay), and inline `CueEditorTable`.
   - `Movie Search`: TMDB catalog lookup + concurrent multi-provider subtitle search (`OpenSubtitles` and `SubDL`) with provider-grouped results, language/format filters, cross-provider deduplication, and independent provider retries.
-  - `Saved Library`: Cached project browser with one-click reopen and `.SRT`/`.ASS` export.
-  - `Export & Style`: Visual ASS hierarchy controls, custom 3-line ordering, and `.SRT`/`.ASS` downloads.
+  - `Saved Library`: Cached project browser with one-click reopen and `.SRT`/`.VTT`/`.ASS` export.
+  - `Export & Style`: Visual ASS hierarchy controls, custom 3-line ordering, and `.SRT`/`.VTT`/`.ASS` downloads.
   - `Settings`: Server-side Integration Diagnostics (`Google Gemini AI`, `TMDB`, `OpenSubtitles`, `SubDL`) with configuration status, verification status, last successful check timestamps, safe error descriptions, and live `Test Connection` actions.
 - **Backend (`server.ts`, `server/`)**: Express API server keeping all API credentials strictly server-side.
-  - `server/subtitles/parser.ts`: Encoding detection (UTF-8 strict check, UTF-16LE/BE BOM & BOM-less, Windows-1252, Shift_JIS), SDH cleanup, multiline merging, and duplicate detection.
-  - `server/subtitles/aligner.ts`: Global timing offset estimation, 1-to-many / many-to-1 / unmatched cue preservation, confidence scoring.
-  - `server/ai/translator.ts`: Batched Gemini conversion with strict JSON/non-IPA/non-Latin validation, retries, glossary consistency, and line caching.
+  - `server/subtitles/parser.ts`: Encoding detection (UTF-8 strict check, UTF-16LE/BE BOM & BOM-less, Windows-1252, Shift_JIS), SDH cleanup, multiline merging (including CJK spacing rules), overlap diagnostics, and duplicate detection.
+  - `server/subtitles/aligner.ts`: Global timing offset estimation, 1-to-many / many-to-1 / unmatched cue preservation, split-sentence continuation hints, alignment quality auditing, and confidence scoring.
+  - `server/ai/translator.ts`: Batched Gemini conversion with preceding/following cue context windows, cross-cue continuation hints, language- and script-specific phonological rules, strict JSON/non-IPA/non-Latin validation, retries, bilingual+phonetic glossary consistency, and line caching.
+  - `server/subtitles/exporter.ts`: Timing-faithful `.SRT`, `.VTT` (WebVTT), and `.ASS` (v4.00+) export respecting custom 3-line ordering.
   - `server/providers/integrations.ts`: Fault-isolated TMDB, OpenSubtitles, SubDL, and Gemini integrations with explicit auth resolution, timeouts, secret redaction, result normalization, and deduplication.
   - `server/db/store.ts`: Atomic JSON persistence (`data/triline-db.json`), corrupt-file backup, job persistence, and startup recovery of interrupted jobs.
 

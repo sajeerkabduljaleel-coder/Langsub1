@@ -9,6 +9,7 @@ import {
   Upload,
 } from 'lucide-react';
 import {
+  DEFAULT_LEARNING_CONTROLS,
   DEFAULT_PROCESSING_OPTIONS,
   DEFAULT_STYLE_CONFIG,
   SUPPORTED_LANGUAGES,
@@ -19,12 +20,14 @@ import {
   type ConversionMode,
   type IntegrationProviderId,
   type IntegrationsStatus,
+  type LearningControlsConfig,
   type MovieMetadata,
   type ParsedSubtitleResult,
   type PhoneticStyle,
   type ProcessingOptions,
   type ProviderDiagnostic,
   type SavedProject,
+  type TranslationStyle,
   type TriLineCue,
 } from './types/subtitle';
 import { SAMPLE_DATASETS, type SampleDataset } from './data/samples';
@@ -70,6 +73,10 @@ export default function App() {
   const [baseLang, setBaseLang] = useState('English');
   const [targetLang, setTargetLang] = useState('German');
   const [phoneticStyle, setPhoneticStyle] = useState<PhoneticStyle>('hyphenated');
+  const [translationStyle, setTranslationStyle] = useState<TranslationStyle>('natural');
+  const [learningControls, setLearningControls] = useState<LearningControlsConfig>(
+    DEFAULT_LEARNING_CONTROLS,
+  );
   const [processingOptions, setProcessingOptions] = useState<ProcessingOptions>(
     DEFAULT_PROCESSING_OPTIONS,
   );
@@ -308,6 +315,7 @@ export default function App() {
     setBaseLang(p.baseLang);
     setTargetLang(p.targetLang);
     setPhoneticStyle(p.phoneticStyle);
+    setTranslationStyle(p.translationStyle || 'natural');
     setMovieMetadata({
       movieId: p.movieId,
       title: p.title,
@@ -378,6 +386,7 @@ export default function App() {
           baseLang,
           targetLang,
           phoneticStyle,
+          translationStyle,
           processingOptions,
           styleConfig,
           primaryParsed,
@@ -459,7 +468,7 @@ export default function App() {
   };
 
   const handleExport = async (
-    format: 'srt' | 'ass',
+    format: 'srt' | 'ass' | 'vtt',
     targetCues: TriLineCue[] = cues,
     targetStyle: AssStyleConfig = styleConfig,
     fileBaseName?: string,
@@ -494,7 +503,7 @@ export default function App() {
     }
   };
 
-  const handleExportProjectFromLibrary = async (id: string, format: 'srt' | 'ass') => {
+  const handleExportProjectFromLibrary = async (id: string, format: 'srt' | 'ass' | 'vtt') => {
     const res = await fetch(`/api/projects/${id}`);
     if (!res.ok) return;
     const data = (await res.json()) as { project: SavedProject };
@@ -694,8 +703,8 @@ export default function App() {
                   </p>
                 </div>
 
-                {/* Language Pair + Phonetic Convention */}
-                <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                {/* Language Pair + Translation Style + Phonetic Convention */}
+                <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
                   <label className="block">
                     <span className="text-xs font-medium text-slate-700">Base Language</span>
                     <select
@@ -727,6 +736,22 @@ export default function App() {
                   </label>
 
                   <label className="block">
+                    <span className="text-xs font-medium text-slate-700">Translation Style</span>
+                    <select
+                      value={translationStyle}
+                      onChange={(e) =>
+                        setTranslationStyle(e.target.value as TranslationStyle)
+                      }
+                      className="mt-1 w-full px-2.5 py-2 text-sm bg-white border border-slate-200 rounded-lg text-slate-900"
+                    >
+                      <option value="natural">Natural Dialogue</option>
+                      <option value="literal">Close / Literal</option>
+                      <option value="colloquial">Colloquial / Spoken</option>
+                      <option value="formal">Formal Register</option>
+                    </select>
+                  </label>
+
+                  <label className="block">
                     <span className="text-xs font-medium text-slate-700">Phonetic Style</span>
                     <select
                       value={phoneticStyle}
@@ -735,6 +760,7 @@ export default function App() {
                     >
                       <option value="hyphenated">Syllable Stress</option>
                       <option value="flowing">Natural Flow</option>
+                      <option value="standard">Standard Romanization</option>
                     </select>
                   </label>
                 </div>
@@ -917,6 +943,14 @@ export default function App() {
                       <span>Merged Lines: {primaryParsed.report.mergedLineCount}</span>
                       <span>·</span>
                       <span>Output Cues: {primaryParsed.report.finalCueCount}</span>
+                      {(primaryParsed.report.overlappingCueCount ?? 0) > 0 && (
+                        <>
+                          <span>·</span>
+                          <span className="text-amber-700 font-medium">
+                            Overlapping Cues: {primaryParsed.report.overlappingCueCount}
+                          </span>
+                        </>
+                      )}
                     </div>
                   </div>
                 )}
@@ -1017,6 +1051,8 @@ export default function App() {
                 activeCueIndex={activeCueIndex}
                 onSelectCueIndex={setActiveCueIndex}
                 title={movieMetadata?.title || primaryParsed?.fileName}
+                learningControls={learningControls}
+                onChangeLearningControls={setLearningControls}
               />
 
               {cues.length > 0 && (
@@ -1042,6 +1078,15 @@ export default function App() {
                     >
                       <Download className="w-3.5 h-3.5" />
                       .SRT
+                    </button>
+                    <button
+                      type="button"
+                      disabled={isExporting}
+                      onClick={() => void handleExport('vtt')}
+                      className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold text-slate-800 bg-slate-100 hover:bg-slate-200 rounded-lg transition-colors cursor-pointer whitespace-nowrap"
+                    >
+                      <Download className="w-3.5 h-3.5" />
+                      .VTT
                     </button>
                     <button
                       type="button"
@@ -1120,6 +1165,7 @@ export default function App() {
                 }}
                 cues={cues}
                 onDownloadSrt={() => void handleExport('srt')}
+                onDownloadVtt={() => void handleExport('vtt')}
                 onDownloadAss={() => void handleExport('ass')}
                 isExporting={isExporting}
               />
@@ -1132,6 +1178,8 @@ export default function App() {
                 activeCueIndex={activeCueIndex}
                 onSelectCueIndex={setActiveCueIndex}
                 title={movieMetadata?.title || primaryParsed?.fileName}
+                learningControls={learningControls}
+                onChangeLearningControls={setLearningControls}
               />
               {hasUnsavedEdits && activeProjectId && (
                 <div className="flex justify-end">
