@@ -184,6 +184,7 @@ export default function App() {
       if (slot === 'primary') {
         setPrimaryParsed(data.parsed);
         setPrimaryRawBase64(data.rawBase64);
+        setActiveJob(null);
       } else {
         setSecondaryParsed(data.parsed);
         setSecondaryRawBase64(data.rawBase64);
@@ -709,7 +710,13 @@ export default function App() {
                     <span className="text-xs font-medium text-slate-700">Base Language</span>
                     <select
                       value={baseLang}
-                      onChange={(e) => setBaseLang(e.target.value)}
+                      onChange={(e) => {
+                        const nextBase = e.target.value;
+                        if (nextBase === targetLang) {
+                          setTargetLang(baseLang);
+                        }
+                        setBaseLang(nextBase);
+                      }}
                       className="mt-1 w-full px-2.5 py-2 text-sm bg-white border border-slate-200 rounded-lg text-slate-900"
                     >
                       {SUPPORTED_LANGUAGES.map((l) => (

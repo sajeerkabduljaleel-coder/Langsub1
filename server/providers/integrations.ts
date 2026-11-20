@@ -750,59 +750,78 @@ export async function downloadOpenSubtitleFile(
   if (!apiKey) {
     throw new ProviderRequestError('OPENSUBTITLES_API_KEY is not configured.', 'unconfigured');
   }
-  if (!fileId || Number.isNaN(Number(fileId))) {
+  const cleanId = (fileId || '').trim();
+  if (!/^\d+$/.test(cleanId) || Number(cleanId) <= 0) {
     throw new ProviderRequestError('Invalid OpenSubtitles file ID.', 'upstream', 400);
   }
 
-  const res = await fetchWithTimeout(
-    'https://api.opensubtitles.com/api/v1/download',
-    {
-      method: 'POST',
-      headers: {
-        'Api-Key': apiKey,
-        'User-Agent': process.env.OPENSUBTITLES_USER_AGENT?.trim() || 'TriLineStudio v1.0',
-        'Content-Type': 'application/json',
-        Accept: 'application/json',
+  try {
+    const res = await fetchWithTimeout(
+      'https://api.opensubtitles.com/api/v1/download',
+      {
+        method: 'POST',
+        headers: {
+          'Api-Key': apiKey,
+          'User-Agent': process.env.OPENSUBTITLES_USER_AGENT?.trim() || 'TriLineStudio v1.0',
+          'Content-Type': 'application/json',
+          Accept: 'application/json',
+        },
+        body: JSON.stringify({ file_id: Number(cleanId) }),
       },
-      body: JSON.stringify({ file_id: Number(fileId) }),
-    },
-    deps,
-  );
+      deps,
+    );
 
-  if (!res.ok) {
-    const errText = await res.text().catch(() => '');
-    throw buildHttpError(
+    if (!res.ok) {
+      const errText = await res.text().catch(() => '');
+      throw buildHttpError(
+        'OpenSubtitles',
+        res,
+        errText,
+        'Verify OPENSUBTITLES_API_KEY and download quota.',
+      );
+    }
+
+    const data = (await res.json()) as { link?: string; file_name?: string; message?: string };
+    if (!data.link) {
+      throw new ProviderRequestError(
+        sanitizeProviderMessage(
+          data.message || 'OpenSubtitles did not return a download URL.',
+        ),
+        'upstream',
+      );
+    }
+
+    const fileRes = await fetchWithTimeout(data.link, undefined, deps);
+    if (!fileRes.ok) {
+      throw new ProviderRequestError(
+        `Failed to download OpenSubtitles subtitle payload (HTTP ${fileRes.status}).`,
+        fileRes.status === 429 ? 'rate_limit' : 'upstream',
+        fileRes.status,
+      );
+    }
+
+    const arrBuf = await fileRes.arrayBuffer();
+    const rawBuffer = Buffer.from(arrBuf);
+    const unwrapped = unwrapDownloadedSubtitlePayload(
+      rawBuffer,
+      data.file_name || `opensubtitles_${cleanId}.srt`,
       'OpenSubtitles',
-      res,
-      errText,
-      'Verify OPENSUBTITLES_API_KEY and download quota.',
     );
+    recordProviderSuccess('opensubtitles');
+    return unwrapped;
+  } catch (err: unknown) {
+    const safeErr =
+      err instanceof ProviderRequestError
+        ? err
+        : new ProviderRequestError(
+            sanitizeProviderMessage(
+              err instanceof Error ? err.message : 'OpenSubtitles download failed.',
+            ),
+            'network',
+          );
+    recordProviderFailure('opensubtitles', safeErr.message);
+    throw safeErr;
   }
-
-  const data = (await res.json()) as { link?: string; file_name?: string; message?: string };
-  if (!data.link) {
-    throw new ProviderRequestError(
-      sanitizeProviderMessage(
-        data.message || 'OpenSubtitles did not return a download URL.',
-      ),
-      'upstream',
-    );
-  }
-
-  const fileRes = await fetchWithTimeout(data.link, undefined, deps);
-  if (!fileRes.ok) {
-    throw new ProviderRequestError(
-      `Failed to download OpenSubtitles subtitle payload (HTTP ${fileRes.status}).`,
-      'upstream',
-      fileRes.status,
-    );
-  }
-
-  const arrBuf = await fileRes.arrayBuffer();
-  return {
-    buffer: Buffer.from(arrBuf),
-    fileName: data.file_name || `opensubtitles_${fileId}.srt`,
-  };
 }
 
 export async function searchSubdl(
@@ -1035,10 +1054,57 @@ export async function searchAllSubtitleProviders(
 }
 
 /**
- * Minimal pure-Node ZIP extractor for single subtitle archive downloads (e.g. Subdl).
+ * Extracts the first readable subtitle file (.srt/.vtt/.ass/.ssa) from a ZIP archive.
+ * Parses the ZIP Central Directory first (supporting directory entries and bit-3 data descriptors),
+ * then falls back to scanning Local File Headers cleanly without aborting on zero-byte entries.
  */
 function extractSubtitleFromZip(zipBuffer: Buffer): { buffer: Buffer; fileName: string } | null {
-  // Local file header signature: 0x04034b50
+  const isSubtitleName = (name: string) => /\.(srt|vtt|ass|ssa)$/i.test(name);
+
+  // 1. Central Directory lookup via End of Central Directory (0x06054b50)
+  const minEocdOffset = Math.max(0, zipBuffer.length - 65557);
+  for (let pos = zipBuffer.length - 22; pos >= minEocdOffset; pos--) {
+    if (zipBuffer.readUInt32LE(pos) !== 0x06054b50) continue;
+    const cdSize = zipBuffer.readUInt32LE(pos + 12);
+    const cdOffset = zipBuffer.readUInt32LE(pos + 16);
+    if (cdOffset + cdSize > zipBuffer.length) break;
+
+    let cdPos = cdOffset;
+    while (cdPos + 46 <= cdOffset + cdSize) {
+      if (zipBuffer.readUInt32LE(cdPos) !== 0x02014b50) break;
+      const compression = zipBuffer.readUInt16LE(cdPos + 10);
+      const compressedSize = zipBuffer.readUInt32LE(cdPos + 20);
+      const nameLen = zipBuffer.readUInt16LE(cdPos + 28);
+      const extraLen = zipBuffer.readUInt16LE(cdPos + 30);
+      const commentLen = zipBuffer.readUInt16LE(cdPos + 32);
+      const localHeaderOffset = zipBuffer.readUInt32LE(cdPos + 42);
+      const fileName = zipBuffer
+        .subarray(cdPos + 46, cdPos + 46 + nameLen)
+        .toString('utf8');
+      cdPos += 46 + nameLen + extraLen + commentLen;
+
+      if (
+        !fileName.endsWith('/') &&
+        isSubtitleName(fileName) &&
+        compressedSize > 0 &&
+        localHeaderOffset + 30 <= zipBuffer.length &&
+        zipBuffer.readUInt32LE(localHeaderOffset) === 0x04034b50
+      ) {
+        const lNameLen = zipBuffer.readUInt16LE(localHeaderOffset + 26);
+        const lExtraLen = zipBuffer.readUInt16LE(localHeaderOffset + 28);
+        const dataStart = localHeaderOffset + 30 + lNameLen + lExtraLen;
+        const dataEnd = dataStart + compressedSize;
+        if (dataEnd <= zipBuffer.length) {
+          const compressedData = zipBuffer.subarray(dataStart, dataEnd);
+          if (compression === 0) return { buffer: compressedData, fileName };
+          if (compression === 8) return { buffer: zlib.inflateRawSync(compressedData), fileName };
+        }
+      }
+    }
+    break;
+  }
+
+  // 2. Local File Header fallback scan (does not break on zero-length directory entries)
   let offset = 0;
   while (offset + 30 <= zipBuffer.length) {
     const sig = zipBuffer.readUInt32LE(offset);
@@ -1051,27 +1117,73 @@ function extractSubtitleFromZip(zipBuffer: Buffer): { buffer: Buffer; fileName: 
 
     const nameStart = offset + 30;
     const nameEnd = nameStart + fileNameLength;
+    if (nameEnd > zipBuffer.length) break;
     const fileName = zipBuffer.subarray(nameStart, nameEnd).toString('utf8');
     const dataStart = nameEnd + extraLength;
     const dataEnd = dataStart + compressedSize;
+    if (dataEnd > zipBuffer.length) break;
 
-    if (compressedSize > 0 && dataEnd <= zipBuffer.length) {
-      const isSubtitle = /\.(srt|vtt|ass|ssa)$/i.test(fileName);
-      if (isSubtitle) {
-        const compressedData = zipBuffer.subarray(dataStart, dataEnd);
-        if (compression === 0) {
-          return { buffer: compressedData, fileName };
-        }
-        if (compression === 8) {
-          return { buffer: zlib.inflateRawSync(compressedData), fileName };
-        }
+    if (compressedSize > 0 && isSubtitleName(fileName)) {
+      const compressedData = zipBuffer.subarray(dataStart, dataEnd);
+      if (compression === 0) {
+        return { buffer: compressedData, fileName };
+      }
+      if (compression === 8) {
+        return { buffer: zlib.inflateRawSync(compressedData), fileName };
       }
     }
 
-    if (compressedSize === 0) break;
     offset = dataEnd;
   }
   return null;
+}
+
+function unwrapDownloadedSubtitlePayload(
+  rawBuffer: Buffer,
+  fallbackFileName: string,
+  providerLabel: string,
+): { buffer: Buffer; fileName: string } {
+  if (rawBuffer.length === 0) {
+    throw new ProviderRequestError(
+      `${providerLabel} returned an empty subtitle file.`,
+      'upstream',
+    );
+  }
+
+  // ZIP archive (PK\x03\x04)
+  if (rawBuffer.length >= 4 && rawBuffer[0] === 0x50 && rawBuffer[1] === 0x4b) {
+    const extracted = extractSubtitleFromZip(rawBuffer);
+    if (!extracted) {
+      throw new ProviderRequestError(
+        `Downloaded ${providerLabel} archive did not contain a readable SRT/VTT/ASS file.`,
+        'upstream',
+      );
+    }
+    return extracted;
+  }
+
+  // GZIP stream (\x1f\x8b)
+  if (rawBuffer.length >= 3 && rawBuffer[0] === 0x1f && rawBuffer[1] === 0x8b) {
+    const inflated = zlib.gunzipSync(rawBuffer);
+    return {
+      buffer: inflated,
+      fileName: fallbackFileName.replace(/\.gz$/i, '') || 'subtitle.srt',
+    };
+  }
+
+  // Reject HTML error / rate-limit walls disguised as 200 OK
+  const head = rawBuffer.subarray(0, 256).toString('utf8').trimStart().toLowerCase();
+  if (head.startsWith('<!doctype html') || head.startsWith('<html')) {
+    throw new ProviderRequestError(
+      `${providerLabel} returned an HTML error page instead of a subtitle file.`,
+      'upstream',
+    );
+  }
+
+  return {
+    buffer: rawBuffer,
+    fileName: fallbackFileName,
+  };
 }
 
 export async function downloadSubdlFile(
@@ -1094,32 +1206,37 @@ export async function downloadSubdlFile(
   }
   const fullUrl = urlObj.toString();
 
-  const res = await fetchWithTimeout(fullUrl, undefined, deps);
-  if (!res.ok) {
-    throw new ProviderRequestError(
-      `SubDL download failed (HTTP ${res.status}).`,
-      res.status === 429 ? 'rate_limit' : 'upstream',
-      res.status,
-    );
-  }
-
-  const buffer = Buffer.from(await res.arrayBuffer());
-  // Check if ZIP archive (PK\x03\x04)
-  if (buffer.length >= 4 && buffer[0] === 0x50 && buffer[1] === 0x4b) {
-    const extracted = extractSubtitleFromZip(buffer);
-    if (!extracted) {
+  try {
+    const res = await fetchWithTimeout(fullUrl, undefined, deps);
+    if (!res.ok) {
       throw new ProviderRequestError(
-        'Downloaded SubDL archive did not contain a readable SRT/VTT/ASS file.',
-        'upstream',
+        `SubDL download failed (HTTP ${res.status}).`,
+        res.status === 429 ? 'rate_limit' : 'upstream',
+        res.status,
       );
     }
-    return extracted;
-  }
 
-  return {
-    buffer,
-    fileName: downloadPath.split('/').pop() || 'subdl_subtitle.srt',
-  };
+    const buffer = Buffer.from(await res.arrayBuffer());
+    const unwrapped = unwrapDownloadedSubtitlePayload(
+      buffer,
+      downloadPath.split('/').pop() || 'subdl_subtitle.srt',
+      'SubDL',
+    );
+    recordProviderSuccess('subdl');
+    return unwrapped;
+  } catch (err: unknown) {
+    const safeErr =
+      err instanceof ProviderRequestError
+        ? err
+        : new ProviderRequestError(
+            sanitizeProviderMessage(
+              err instanceof Error ? err.message : 'SubDL download failed.',
+            ),
+            'network',
+          );
+    recordProviderFailure('subdl', safeErr.message);
+    throw safeErr;
+  }
 }
 
 export async function verifyProviderConnection(

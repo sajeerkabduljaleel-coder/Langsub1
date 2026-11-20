@@ -64,7 +64,10 @@ export function CinemaPreview({
   );
   const [elapsedMs, setElapsedMs] = useState(0);
   const [pauseRemainingMs, setPauseRemainingMs] = useState(0);
-  const [manualWordIdx, setManualWordIdx] = useState<number | null>(null);
+  const [manualWord, setManualWord] = useState<{
+    role: SubtitleLineRole;
+    index: number;
+  } | null>(null);
 
   const learning = learningControls ?? internalLearning;
   const updateLearning = (patch: Partial<LearningControlsConfig>) => {
@@ -83,10 +86,20 @@ export function CinemaPreview({
     learning.playbackSpeed,
   );
 
+  // Stop playback cleanly if cues are cleared
+  useEffect(() => {
+    if (cues.length === 0) {
+      setIsPlaying(false);
+      setElapsedMs(0);
+      setPauseRemainingMs(0);
+      setManualWord(null);
+    }
+  }, [cues.length]);
+
   // Reset elapsed progress when switching cues manually
   useEffect(() => {
     setElapsedMs(0);
-    setManualWordIdx(null);
+    setManualWord(null);
   }, [safeIndex]);
 
   // Ref holds mutable playback tick state to avoid restarting interval on every 100ms tick
@@ -195,9 +208,11 @@ export function CinemaPreview({
 
   const handleReplayCue = () => {
     if (cues.length === 0) return;
+    tickStateRef.current.elapsedMs = 0;
+    tickStateRef.current.pauseRemainingMs = 0;
     setPauseRemainingMs(0);
     setElapsedMs(0);
-    setManualWordIdx(null);
+    setManualWord(null);
     setIsPlaying(true);
   };
 
@@ -416,7 +431,11 @@ export function CinemaPreview({
                     const activeWordIdx = learning.highlightWords
                       ? isPlaying && pauseRemainingMs === 0
                         ? getActiveWordIndex(tokens, elapsedMs, effectiveDurationMs)
-                        : manualWordIdx ?? 0
+                        : manualWord?.role === line.role
+                          ? manualWord.index
+                          : manualWord
+                            ? -1
+                            : 0
                       : -1;
 
                     return (
@@ -440,7 +459,7 @@ export function CinemaPreview({
                                 <button
                                   key={`${line.role}-${tIdx}`}
                                   type="button"
-                                  onClick={() => setManualWordIdx(tIdx)}
+                                  onClick={() => setManualWord({ role: line.role, index: tIdx })}
                                   className={`rounded px-0.5 transition-colors cursor-pointer ${
                                     isActiveWord
                                       ? 'bg-white/25 underline decoration-2 underline-offset-2'

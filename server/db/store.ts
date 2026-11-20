@@ -76,9 +76,29 @@ async function ensureDbLoaded(): Promise<DatabaseSchema> {
     try {
       const raw = await fs.readFile(dbPath, 'utf8');
       const parsed = JSON.parse(raw) as Partial<DatabaseSchema>;
+      const rawProjects = Array.isArray(parsed.projects) ? parsed.projects : [];
+      const validProjects = rawProjects.filter(
+        (p): p is SavedProject =>
+          Boolean(p) &&
+          typeof p === 'object' &&
+          typeof p.id === 'string' &&
+          p.id.length > 0 &&
+          typeof p.title === 'string' &&
+          Array.isArray(p.cues) &&
+          p.cues.every(
+            (c) =>
+              Boolean(c) &&
+              typeof c === 'object' &&
+              typeof c.startMs === 'number' &&
+              Number.isFinite(c.startMs) &&
+              typeof c.endMs === 'number' &&
+              Number.isFinite(c.endMs) &&
+              c.endMs >= c.startMs,
+          ),
+      );
       memoryDb = {
         version: parsed.version || 2,
-        projects: Array.isArray(parsed.projects) ? parsed.projects : [],
+        projects: validProjects,
         lineCache:
           parsed.lineCache && typeof parsed.lineCache === 'object' ? parsed.lineCache : {},
         jobs: parsed.jobs && typeof parsed.jobs === 'object' ? parsed.jobs : {},

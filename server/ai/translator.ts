@@ -27,7 +27,7 @@ const IPA_FORBIDDEN_REGEX =
 
 // Non-Latin scripts that must NEVER leak into English-intuitive phonetic lines
 const NON_LATIN_SCRIPT_REGEX =
-  /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\u0400-\u04ff\u0600-\u06ff\u0900-\u097f]/;
+  /[\u1100-\u11ff\u3040-\u30ff\u3130-\u318f\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\u0400-\u04ff\u0590-\u05ff\u0600-\u06ff\u0900-\u097f]/;
 
 function getAiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -541,7 +541,21 @@ export async function processTriLineConversion(params: {
 
       const firstIdx = batchSlotIndices[0];
       const lastIdx = batchSlotIndices[batchSlotIndices.length - 1];
-      const contextBefore = params.cues.slice(Math.max(0, firstIdx - 3), firstIdx);
+      const contextBefore: BatchInputCue[] = [];
+      for (let ci = Math.max(0, firstIdx - 3); ci < firstIdx; ci++) {
+        const resolved = results[ci];
+        contextBefore.push(
+          resolved
+            ? {
+                index: resolved.index,
+                startMs: resolved.startMs,
+                endMs: resolved.endMs,
+                baseText: resolved.baseText,
+                targetText: resolved.targetText,
+              }
+            : params.cues[ci],
+        );
+      }
       const contextAfter = params.cues.slice(lastIdx + 1, Math.min(totalCues, lastIdx + 3));
       const glossaryEntries = Array.from(glossaryMap.entries()).map(
         ([targetText, entry]) => ({

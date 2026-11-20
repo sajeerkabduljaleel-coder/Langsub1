@@ -367,6 +367,14 @@ async function startServer() {
       if (!primaryParsed?.cues?.length) {
         return res.status(400).json({ error: 'Primary subtitle cues are required.' });
       }
+      if (!['target-first', 'base-first', 'dual-merge'].includes(mode)) {
+        return res.status(400).json({ error: 'Unsupported conversion mode.' });
+      }
+      if (mode === 'dual-merge' && !secondaryParsed?.cues?.length) {
+        return res.status(400).json({
+          error: 'Dual-File Merge requires both primary and secondary subtitle cues.',
+        });
+      }
 
       const hasManualAlignedPairs = Array.isArray(alignedPairs) && alignedPairs.length > 0;
       const alignmentOverridesHash = hasManualAlignedPairs
@@ -590,8 +598,9 @@ async function startServer() {
           }
         } catch (err: unknown) {
           const current = jobs.get(jobId);
-          const message =
+          const rawMessage =
             err instanceof Error ? err.message : 'Subtitle conversion failed.';
+          const message = sanitizeProviderMessage(rawMessage);
           if (current) {
             const failedJob: ConversionJob = {
               ...current,
@@ -679,16 +688,47 @@ async function startServer() {
     if (!project) {
       return res.status(404).json({ error: 'Project not found.' });
     }
+    if (!Array.isArray(project.cues) || project.cues.length === 0) {
+      return res.status(422).json({ error: 'Project subtitle data is incomplete or invalid.' });
+    }
     res.json({ project });
   });
 
   app.patch('/api/projects/:id', async (req, res) => {
-    const { cues, styleConfig, title } = req.body as {
+    const { cues, styleConfig, title } = (req.body || {}) as {
       cues?: TriLineCue[];
       styleConfig?: AssStyleConfig;
       title?: string;
     };
-    const updated = await updateProject(req.params.id, { cues, styleConfig, title });
+    if (cues !== undefined) {
+      const validCues =
+        Array.isArray(cues) &&
+        cues.length > 0 &&
+        cues.every(
+          (c) =>
+            Boolean(c) &&
+            typeof c === 'object' &&
+            typeof c.startMs === 'number' &&
+            Number.isFinite(c.startMs) &&
+            typeof c.endMs === 'number' &&
+            Number.isFinite(c.endMs) &&
+            c.endMs >= c.startMs &&
+            typeof c.baseText === 'string' &&
+            typeof c.targetText === 'string' &&
+            typeof c.phoneticText === 'string',
+        );
+      if (!validCues) {
+        return res.status(400).json({ error: 'Invalid or incomplete subtitle cues payload.' });
+      }
+    }
+    if (title !== undefined && (typeof title !== 'string' || !title.trim())) {
+      return res.status(400).json({ error: 'Project title must be a non-empty string.' });
+    }
+    const updated = await updateProject(req.params.id, {
+      cues,
+      styleConfig,
+      title: title?.trim(),
+    });
     if (!updated) {
       return res.status(404).json({ error: 'Project not found.' });
     }
@@ -703,17 +743,37 @@ async function startServer() {
     res.json({ deleted: true });
   });
 
-  // Server-side formatted SRT and ASS export
+  function isValidExportCues(cues: unknown): cues is TriLineCue[] {
+    return (
+      Array.isArray(cues) &&
+      cues.length > 0 &&
+      cues.every(
+        (c) =>
+          Boolean(c) &&
+          typeof c === 'object' &&
+          typeof (c as TriLineCue).startMs === 'number' &&
+          Number.isFinite((c as TriLineCue).startMs) &&
+          typeof (c as TriLineCue).endMs === 'number' &&
+          Number.isFinite((c as TriLineCue).endMs) &&
+          (c as TriLineCue).endMs >= (c as TriLineCue).startMs,
+      )
+    );
+  }
+
+  // Server-side formatted SRT, VTT and ASS export
   app.post('/api/export/srt', (req, res) => {
-    const { cues, styleConfig, fileName } = req.body as {
+    const { cues, styleConfig, fileName } = (req.body || {}) as {
       cues?: TriLineCue[];
       styleConfig?: AssStyleConfig;
       fileName?: string;
     };
-    if (!cues?.length) {
-      return res.status(400).json({ error: 'Cues are required for export.' });
+    if (!isValidExportCues(cues)) {
+      return res.status(400).json({ error: 'Valid cues with timestamps are required for export.' });
     }
-    const content = generateSrtContent(cues, styleConfig || DEFAULT_STYLE_CONFIG);
+    const content = generateSrtContent(cues, {
+      ...DEFAULT_STYLE_CONFIG,
+      ...(styleConfig || {}),
+    });
     const safeName = (fileName || 'triline_subtitles').replace(/[^a-zA-Z0-9._-]/g, '_');
     res.setHeader('Content-Type', 'application/x-subrip; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}.triline.srt"`);
@@ -721,18 +781,18 @@ async function startServer() {
   });
 
   app.post('/api/export/ass', (req, res) => {
-    const { cues, styleConfig, fileName, title } = req.body as {
+    const { cues, styleConfig, fileName, title } = (req.body || {}) as {
       cues?: TriLineCue[];
       styleConfig?: AssStyleConfig;
       fileName?: string;
       title?: string;
     };
-    if (!cues?.length) {
-      return res.status(400).json({ error: 'Cues are required for export.' });
+    if (!isValidExportCues(cues)) {
+      return res.status(400).json({ error: 'Valid cues with timestamps are required for export.' });
     }
     const content = generateAssContent(
       cues,
-      styleConfig || DEFAULT_STYLE_CONFIG,
+      { ...DEFAULT_STYLE_CONFIG, ...(styleConfig || {}) },
       title || 'TriLine Studio Export',
     );
     const safeName = (fileName || 'triline_subtitles').replace(/[^a-zA-Z0-9._-]/g, '_');
@@ -742,15 +802,18 @@ async function startServer() {
   });
 
   app.post('/api/export/vtt', (req, res) => {
-    const { cues, styleConfig, fileName } = req.body as {
+    const { cues, styleConfig, fileName } = (req.body || {}) as {
       cues?: TriLineCue[];
       styleConfig?: AssStyleConfig;
       fileName?: string;
     };
-    if (!cues?.length) {
-      return res.status(400).json({ error: 'Cues are required for export.' });
+    if (!isValidExportCues(cues)) {
+      return res.status(400).json({ error: 'Valid cues with timestamps are required for export.' });
     }
-    const content = generateVttContent(cues, styleConfig || DEFAULT_STYLE_CONFIG);
+    const content = generateVttContent(cues, {
+      ...DEFAULT_STYLE_CONFIG,
+      ...(styleConfig || {}),
+    });
     const safeName = (fileName || 'triline_subtitles').replace(/[^a-zA-Z0-9._-]/g, '_');
     res.setHeader('Content-Type', 'text/vtt; charset=utf-8');
     res.setHeader('Content-Disposition', `attachment; filename="${safeName}.triline.vtt"`);
