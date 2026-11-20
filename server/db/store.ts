@@ -11,6 +11,12 @@ import type {
   TranslationStyle,
   TriLineCue,
 } from '../../src/types/subtitle.ts';
+import {
+  isPlainObject,
+  validateAndNormalizeProject,
+  validateStyleConfigInput,
+  validateTriLineCue,
+} from '../validation/projectValidation.ts';
 
 export const DEFAULT_GEMINI_MODEL = 'gemini-4-hydrogen';
 export const DEFAULT_PROMPT_VERSION = 'v3';
@@ -77,31 +83,24 @@ async function ensureDbLoaded(): Promise<DatabaseSchema> {
       const raw = await fs.readFile(dbPath, 'utf8');
       const parsed = JSON.parse(raw) as Partial<DatabaseSchema>;
       const rawProjects = Array.isArray(parsed.projects) ? parsed.projects : [];
-      const validProjects = rawProjects.filter(
-        (p): p is SavedProject =>
-          Boolean(p) &&
-          typeof p === 'object' &&
-          typeof p.id === 'string' &&
-          p.id.length > 0 &&
-          typeof p.title === 'string' &&
-          Array.isArray(p.cues) &&
-          p.cues.every(
-            (c) =>
-              Boolean(c) &&
-              typeof c === 'object' &&
-              typeof c.startMs === 'number' &&
-              Number.isFinite(c.startMs) &&
-              typeof c.endMs === 'number' &&
-              Number.isFinite(c.endMs) &&
-              c.endMs >= c.startMs,
-          ),
-      );
+      const validProjects: SavedProject[] = [];
+      for (const rawProject of rawProjects) {
+        const checked = validateAndNormalizeProject(rawProject, {
+          forPersistenceLoad: true,
+        });
+        if (checked.ok) {
+          validProjects.push(checked.project);
+        }
+      }
       memoryDb = {
-        version: parsed.version || 2,
+        version: typeof parsed.version === 'number' && Number.isFinite(parsed.version) ? parsed.version : 2,
         projects: validProjects,
-        lineCache:
-          parsed.lineCache && typeof parsed.lineCache === 'object' ? parsed.lineCache : {},
-        jobs: parsed.jobs && typeof parsed.jobs === 'object' ? parsed.jobs : {},
+        lineCache: isPlainObject(parsed.lineCache)
+          ? (parsed.lineCache as Record<string, LineCacheEntry>)
+          : {},
+        jobs: isPlainObject(parsed.jobs)
+          ? (parsed.jobs as Record<string, PersistedJobRecord>)
+          : {},
       };
     } catch (err: unknown) {
       const code = (err as NodeJS.ErrnoException)?.code;
@@ -247,33 +246,78 @@ export async function getProjectById(id: string): Promise<SavedProject | null> {
 }
 
 export async function saveProject(project: SavedProject): Promise<SavedProject> {
+  const checked = validateAndNormalizeProject(project, { forPersistenceLoad: false });
+  if (!checked.ok) {
+    throw new Error(`Invalid project payload: ${checked.error}`);
+  }
+  const normalized = checked.project;
   const db = await ensureDbLoaded();
   const existingIdx = db.projects.findIndex(
-    (p) => p.id === project.id || p.cacheKey === project.cacheKey,
+    (p) => p.id === normalized.id || p.cacheKey === normalized.cacheKey,
   );
   if (existingIdx >= 0) {
-    db.projects[existingIdx] = project;
+    db.projects[existingIdx] = normalized;
   } else {
-    db.projects.unshift(project);
+    db.projects.unshift(normalized);
   }
   await persistDb();
-  return project;
+  return normalized;
 }
 
 export async function updateProject(
   id: string,
   patch: { cues?: TriLineCue[]; styleConfig?: AssStyleConfig; title?: string },
 ): Promise<SavedProject | null> {
+  if (typeof id !== 'string' || !id.trim()) {
+    throw new Error('Project id must be a non-empty string.');
+  }
   const db = await ensureDbLoaded();
   const idx = db.projects.findIndex((p) => p.id === id);
   if (idx === -1) return null;
 
   const current = db.projects[idx];
+
+  let nextTitle = current.title;
+  if (patch.title !== undefined) {
+    if (typeof patch.title !== 'string' || !patch.title.trim()) {
+      throw new Error('Project title must be a non-empty string.');
+    }
+    nextTitle = patch.title.trim();
+  }
+
+  let nextCues = current.cues;
+  if (patch.cues !== undefined) {
+    if (!Array.isArray(patch.cues) || patch.cues.length === 0) {
+      throw new Error('Project cues must be a non-empty array.');
+    }
+    const validatedCues: TriLineCue[] = [];
+    for (let i = 0; i < patch.cues.length; i++) {
+      const cueCheck = validateTriLineCue(patch.cues[i], i + 1, {
+        allowSynthesizeIdentity: false,
+        requireNonEmptyText: true,
+      });
+      if (!cueCheck.ok) {
+        throw new Error(cueCheck.error);
+      }
+      validatedCues.push(cueCheck.cue);
+    }
+    nextCues = validatedCues;
+  }
+
+  let nextStyleConfig = current.styleConfig;
+  if (patch.styleConfig !== undefined) {
+    const styleCheck = validateStyleConfigInput(patch.styleConfig, current.styleConfig);
+    if (!styleCheck.ok) {
+      throw new Error(styleCheck.error);
+    }
+    nextStyleConfig = styleCheck.value;
+  }
+
   const updated: SavedProject = {
     ...current,
-    ...(patch.title !== undefined ? { title: patch.title } : {}),
-    ...(patch.cues !== undefined ? { cues: patch.cues } : {}),
-    ...(patch.styleConfig !== undefined ? { styleConfig: patch.styleConfig } : {}),
+    title: nextTitle,
+    cues: nextCues,
+    styleConfig: nextStyleConfig,
     updatedAt: new Date().toISOString(),
   };
   db.projects[idx] = updated;

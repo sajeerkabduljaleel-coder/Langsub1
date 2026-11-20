@@ -11,6 +11,7 @@ import {
 } from 'lucide-react';
 import {
   DEFAULT_LEARNING_CONTROLS,
+  DEFAULT_STYLE_CONFIG,
   type AssStyleConfig,
   type LearningControlsConfig,
   type SubtitleLineRole,
@@ -18,12 +19,14 @@ import {
 } from '../types/subtitle';
 import {
   computeEffectiveCueDurationMs,
-  getActiveWordIndex,
+  rescaleElapsedForSpeedChange,
   resolveCueTickCompletion,
+  resolveLineActiveWordIndex,
   tokenizeCueWords,
+  type ManualWordSelection,
 } from '../utils/learningControls';
-import cafeStill from '/src/assets/images/cinema_cafe_still_1794633452935.jpg';
-import trainStill from '/src/assets/images/cinema_train_still_1794633453954.jpg';
+import cafeStill from '../assets/images/cinema_cafe_still_1794633452935.jpg';
+import trainStill from '../assets/images/cinema_train_still_1794633453954.jpg';
 
 interface CinemaPreviewProps {
   cues: TriLineCue[];
@@ -64,10 +67,17 @@ export function CinemaPreview({
   );
   const [elapsedMs, setElapsedMs] = useState(0);
   const [pauseRemainingMs, setPauseRemainingMs] = useState(0);
-  const [manualWord, setManualWord] = useState<{
-    role: SubtitleLineRole;
-    index: number;
-  } | null>(null);
+  const [manualWord, setManualWord] = useState<ManualWordSelection>(null);
+
+  const safeCues = Array.isArray(cues) ? cues : [];
+  const safeStyle: AssStyleConfig = {
+    ...DEFAULT_STYLE_CONFIG,
+    ...(styleConfig || {}),
+    lineOrder:
+      Array.isArray(styleConfig?.lineOrder) && styleConfig.lineOrder.length > 0
+        ? styleConfig.lineOrder
+        : DEFAULT_STYLE_CONFIG.lineOrder,
+  };
 
   const learning = learningControls ?? internalLearning;
   const updateLearning = (patch: Partial<LearningControlsConfig>) => {
@@ -79,28 +89,15 @@ export function CinemaPreview({
     }
   };
 
-  const safeIndex = Math.max(0, Math.min(activeCueIndex, Math.max(0, cues.length - 1)));
-  const activeCue = cues[safeIndex] || null;
+  const safeIndex = Math.max(0, Math.min(activeCueIndex, Math.max(0, safeCues.length - 1)));
+  const activeCue = safeCues[safeIndex] || null;
+  const activeCueKey = activeCue
+    ? `${safeIndex}:${activeCue.id}:${activeCue.startMs}:${activeCue.endMs}`
+    : 'empty';
   const effectiveDurationMs = computeEffectiveCueDurationMs(
     activeCue,
     learning.playbackSpeed,
   );
-
-  // Stop playback cleanly if cues are cleared
-  useEffect(() => {
-    if (cues.length === 0) {
-      setIsPlaying(false);
-      setElapsedMs(0);
-      setPauseRemainingMs(0);
-      setManualWord(null);
-    }
-  }, [cues.length]);
-
-  // Reset elapsed progress when switching cues manually
-  useEffect(() => {
-    setElapsedMs(0);
-    setManualWord(null);
-  }, [safeIndex]);
 
   // Ref holds mutable playback tick state to avoid restarting interval on every 100ms tick
   const tickStateRef = useRef({
@@ -110,36 +107,87 @@ export function CinemaPreview({
   });
   tickStateRef.current = { safeIndex, elapsedMs, pauseRemainingMs };
 
+  // Track previous cue identity & duration to rescale elapsedMs cleanly when playbackSpeed changes mid-cue
+  const prevSpeedContextRef = useRef({
+    cueKey: activeCueKey,
+    durationMs: effectiveDurationMs,
+  });
+
+  // Stop playback cleanly if cues are cleared
   useEffect(() => {
-    if (!isPlaying || cues.length === 0) return;
+    if (safeCues.length === 0) {
+      tickStateRef.current = { safeIndex: 0, elapsedMs: 0, pauseRemainingMs: 0 };
+      setIsPlaying(false);
+      setElapsedMs(0);
+      setPauseRemainingMs(0);
+      setManualWord(null);
+    }
+  }, [safeCues.length]);
+
+  // Reset elapsed progress & manual word selection whenever active cue changes (including project switches at index 0)
+  useEffect(() => {
+    tickStateRef.current.elapsedMs = 0;
+    setElapsedMs(0);
+    setManualWord(null);
+    prevSpeedContextRef.current = {
+      cueKey: activeCueKey,
+      durationMs: effectiveDurationMs,
+    };
+  }, [activeCueKey]);
+
+  // Rescale elapsedMs proportionally if playbackSpeed changes mid-cue so word highlighting stays synchronized
+  useEffect(() => {
+    const prev = prevSpeedContextRef.current;
+    if (prev.cueKey === activeCueKey && prev.durationMs !== effectiveDurationMs) {
+      const rescaled = rescaleElapsedForSpeedChange(
+        tickStateRef.current.elapsedMs,
+        prev.durationMs,
+        effectiveDurationMs,
+      );
+      tickStateRef.current.elapsedMs = rescaled;
+      setElapsedMs(rescaled);
+    }
+    prevSpeedContextRef.current = {
+      cueKey: activeCueKey,
+      durationMs: effectiveDurationMs,
+    };
+  }, [activeCueKey, effectiveDurationMs]);
+
+  useEffect(() => {
+    if (!isPlaying || safeCues.length === 0) return;
 
     const timer = window.setInterval(() => {
       const state = tickStateRef.current;
-      const currentCue = cues[state.safeIndex];
+      const currentCue = safeCues[state.safeIndex];
       const cueDur = computeEffectiveCueDurationMs(currentCue, learning.playbackSpeed);
 
       if (state.pauseRemainingMs > 0) {
         const nextPause = Math.max(0, state.pauseRemainingMs - 100);
+        tickStateRef.current.pauseRemainingMs = nextPause;
         setPauseRemainingMs(nextPause);
         return;
       }
 
       const nextElapsed = state.elapsedMs + 100;
       if (nextElapsed < cueDur) {
+        tickStateRef.current.elapsedMs = nextElapsed;
         setElapsedMs(nextElapsed);
         return;
       }
 
       const transition = resolveCueTickCompletion({
         currentIndex: state.safeIndex,
-        totalCues: cues.length,
+        totalCues: safeCues.length,
         repeatCurrentCue: learning.repeatCurrentCue,
         pauseBetweenCuesMs: learning.pauseBetweenCuesMs,
       });
 
+      tickStateRef.current.elapsedMs = transition.nextElapsedMs;
+      tickStateRef.current.pauseRemainingMs = transition.nextPauseRemainingMs;
       setElapsedMs(transition.nextElapsedMs);
       setPauseRemainingMs(transition.nextPauseRemainingMs);
       if (transition.nextCueIndex !== state.safeIndex) {
+        tickStateRef.current.safeIndex = transition.nextCueIndex;
         onSelectCueIndex(transition.nextCueIndex);
       }
       if (transition.nextPhase === 'stopped') {
@@ -150,7 +198,7 @@ export function CinemaPreview({
     return () => window.clearInterval(timer);
   }, [
     isPlaying,
-    cues,
+    safeCues,
     learning.playbackSpeed,
     learning.repeatCurrentCue,
     learning.pauseBetweenCuesMs,
@@ -168,9 +216,9 @@ export function CinemaPreview({
     if (role === 'base') {
       if (!learning.showBase) return null;
       return {
-        text: activeCue.baseText,
-        color: styleConfig.baseColor,
-        sizePx: Math.max(12, Math.round(styleConfig.baseFontSize * 0.42)),
+        text: typeof activeCue.baseText === 'string' ? activeCue.baseText : '',
+        color: safeStyle.baseColor,
+        sizePx: Math.max(12, Math.round(safeStyle.baseFontSize * 0.42)),
         weight: 500,
         label: 'Base',
       };
@@ -178,25 +226,25 @@ export function CinemaPreview({
     if (role === 'target') {
       if (!learning.showTarget) return null;
       return {
-        text: activeCue.targetText,
-        color: styleConfig.targetColor,
-        sizePx: Math.max(13, Math.round(styleConfig.targetFontSize * 0.42)),
+        text: typeof activeCue.targetText === 'string' ? activeCue.targetText : '',
+        color: safeStyle.targetColor,
+        sizePx: Math.max(13, Math.round(safeStyle.targetFontSize * 0.42)),
         weight: 600,
         label: 'Target',
       };
     }
     if (!learning.showPhonetic) return null;
     return {
-      text: activeCue.phoneticText,
-      color: styleConfig.phoneticColor,
-      sizePx: Math.max(11, Math.round(styleConfig.phoneticFontSize * 0.42)),
+      text: typeof activeCue.phoneticText === 'string' ? activeCue.phoneticText : '',
+      color: safeStyle.phoneticColor,
+      sizePx: Math.max(11, Math.round(safeStyle.phoneticFontSize * 0.42)),
       weight: 500,
       label: 'Phonetic',
     };
   };
 
   const visibleLines = activeCue
-    ? styleConfig.lineOrder
+    ? safeStyle.lineOrder
         .map((role) => {
           const line = getLineProps(role);
           return line && line.text ? { role, ...line } : null;
@@ -204,10 +252,30 @@ export function CinemaPreview({
         .filter((l): l is NonNullable<typeof l> => Boolean(l))
     : [];
 
-  const marginPercent = Math.max(3, Math.min(18, Math.round((styleConfig.marginV / 1080) * 100)));
+  const marginPercent = Math.max(3, Math.min(18, Math.round((safeStyle.marginV / 1080) * 100)));
+
+  const handleTogglePlay = () => {
+    if (safeCues.length === 0) return;
+    tickStateRef.current.pauseRemainingMs = 0;
+    setPauseRemainingMs(0);
+    setIsPlaying((prev) => {
+      if (!prev) {
+        // Resuming playback clears any manual word lock so synchronized highlighting resumes smoothly
+        setManualWord(null);
+      }
+      return !prev;
+    });
+  };
+
+  const handleSelectManualWord = (role: SubtitleLineRole, index: number) => {
+    tickStateRef.current.pauseRemainingMs = 0;
+    setPauseRemainingMs(0);
+    setIsPlaying(false);
+    setManualWord({ role, index });
+  };
 
   const handleReplayCue = () => {
-    if (cues.length === 0) return;
+    if (safeCues.length === 0) return;
     tickStateRef.current.elapsedMs = 0;
     tickStateRef.current.pauseRemainingMs = 0;
     setPauseRemainingMs(0);
@@ -229,7 +297,7 @@ export function CinemaPreview({
             <>
               <span aria-hidden="true">·</span>
               <span className="font-mono tabular-nums text-slate-500 whitespace-nowrap">
-                Cue {safeIndex + 1}/{cues.length}
+                Cue {safeIndex + 1}/{safeCues.length}
               </span>
             </>
           )}
@@ -382,7 +450,7 @@ export function CinemaPreview({
         {/* Measured cinema scrim for guaranteed >=4.5:1 subtitle contrast */}
         <div
           className={`absolute inset-0 pointer-events-none ${
-            styleConfig.alignment === 8
+            safeStyle.alignment === 8
               ? 'bg-gradient-to-b from-black/75 via-black/25 to-black/35'
               : 'bg-gradient-to-t from-black/85 via-black/30 to-black/20'
           }`}
@@ -399,10 +467,10 @@ export function CinemaPreview({
         <div
           className={`absolute inset-x-0 px-6 flex flex-col items-center ${
             learning.highlightWords ? '' : 'pointer-events-none'
-          } ${styleConfig.alignment === 8 ? 'justify-start' : 'justify-end'}`}
+          } ${safeStyle.alignment === 8 ? 'justify-start' : 'justify-end'}`}
           style={{
-            top: styleConfig.alignment === 8 ? `${marginPercent}%` : undefined,
-            bottom: styleConfig.alignment === 2 ? `${marginPercent}%` : undefined,
+            top: safeStyle.alignment === 8 ? `${marginPercent}%` : undefined,
+            bottom: safeStyle.alignment === 2 ? `${marginPercent}%` : undefined,
           }}
         >
           {activeCue ? (
@@ -410,33 +478,34 @@ export function CinemaPreview({
               <div
                 className="max-w-[88%] text-center rounded-lg transition-all duration-150"
                 style={{
-                  backgroundColor: styleConfig.opaqueBox
-                    ? `rgba(9, 13, 22, ${styleConfig.boxOpacity / 100})`
+                  backgroundColor: safeStyle.opaqueBox
+                    ? `rgba(9, 13, 22, ${safeStyle.boxOpacity / 100})`
                     : 'transparent',
-                  padding: styleConfig.opaqueBox ? '10px 18px' : '4px 8px',
-                  fontFamily: styleConfig.fontFamily,
+                  padding: safeStyle.opaqueBox ? '10px 18px' : '4px 8px',
+                  fontFamily: safeStyle.fontFamily,
                 }}
               >
                 <div
                   className="flex flex-col items-center"
-                  style={{ gap: `${Math.max(2, Math.round(styleConfig.lineSpacing * 0.6))}px` }}
+                  style={{ gap: `${Math.max(2, Math.round(safeStyle.lineSpacing * 0.6))}px` }}
                 >
                   {visibleLines.map((line) => {
-                    const outlinePx = styleConfig.opaqueBox
+                    const outlinePx = safeStyle.opaqueBox
                       ? 0
-                      : Math.max(0.5, styleConfig.outlineWidth * 0.45);
+                      : Math.max(0.5, safeStyle.outlineWidth * 0.45);
                     const tokens = learning.highlightWords
                       ? tokenizeCueWords(line.text)
                       : [];
-                    const activeWordIdx = learning.highlightWords
-                      ? isPlaying && pauseRemainingMs === 0
-                        ? getActiveWordIndex(tokens, elapsedMs, effectiveDurationMs)
-                        : manualWord?.role === line.role
-                          ? manualWord.index
-                          : manualWord
-                            ? -1
-                            : 0
-                      : -1;
+                    const activeWordIdx = resolveLineActiveWordIndex({
+                      highlightWords: learning.highlightWords,
+                      lineRole: line.role,
+                      tokens,
+                      isPlaying,
+                      pauseRemainingMs,
+                      elapsedMs,
+                      effectiveDurationMs,
+                      manualWord,
+                    });
 
                     return (
                       <div
@@ -446,7 +515,7 @@ export function CinemaPreview({
                           fontSize: `${line.sizePx}px`,
                           fontWeight: line.weight,
                           lineHeight: 1.32,
-                          textShadow: styleConfig.opaqueBox
+                          textShadow: safeStyle.opaqueBox
                             ? 'none'
                             : `0 1px 2px rgba(0,0,0,0.95), 0 0 ${Math.max(2, outlinePx * 2)}px rgba(0,0,0,0.9)`,
                         }}
@@ -459,7 +528,7 @@ export function CinemaPreview({
                                 <button
                                   key={`${line.role}-${tIdx}`}
                                   type="button"
-                                  onClick={() => setManualWord({ role: line.role, index: tIdx })}
+                                  onClick={() => handleSelectManualWord(line.role, tIdx)}
                                   className={`rounded px-0.5 transition-colors cursor-pointer ${
                                     isActiveWord
                                       ? 'bg-white/25 underline decoration-2 underline-offset-2'
@@ -502,11 +571,8 @@ export function CinemaPreview({
         <div className="flex items-center gap-2">
           <button
             type="button"
-            disabled={cues.length === 0}
-            onClick={() => {
-              setPauseRemainingMs(0);
-              setIsPlaying((p) => !p);
-            }}
+            disabled={safeCues.length === 0}
+            onClick={handleTogglePlay}
             aria-label={isPlaying ? 'Pause preview' : 'Play preview'}
             className="inline-flex items-center gap-1.5 px-3 py-1.5 text-xs font-semibold rounded-lg bg-slate-900 text-white hover:bg-slate-800 disabled:opacity-40 transition-colors whitespace-nowrap shrink-0 cursor-pointer"
           >
@@ -516,7 +582,7 @@ export function CinemaPreview({
 
           <button
             type="button"
-            disabled={cues.length === 0}
+            disabled={safeCues.length === 0}
             onClick={handleReplayCue}
             aria-label="Replay current cue"
             title="Replay current cue"
@@ -528,7 +594,7 @@ export function CinemaPreview({
 
           <button
             type="button"
-            disabled={cues.length === 0 || safeIndex <= 0}
+            disabled={safeCues.length === 0 || safeIndex <= 0}
             onClick={() => {
               setIsPlaying(false);
               setPauseRemainingMs(0);
@@ -542,11 +608,11 @@ export function CinemaPreview({
 
           <button
             type="button"
-            disabled={cues.length === 0 || safeIndex >= cues.length - 1}
+            disabled={safeCues.length === 0 || safeIndex >= safeCues.length - 1}
             onClick={() => {
               setIsPlaying(false);
               setPauseRemainingMs(0);
-              onSelectCueIndex(Math.min(cues.length - 1, safeIndex + 1));
+              onSelectCueIndex(Math.min(safeCues.length - 1, safeIndex + 1));
             }}
             aria-label="Next cue"
             className="p-1.5 rounded-lg border border-slate-200 text-slate-700 hover:bg-slate-100 disabled:opacity-40 transition-colors cursor-pointer"
@@ -556,7 +622,7 @@ export function CinemaPreview({
 
           <button
             type="button"
-            disabled={cues.length === 0 || safeIndex === 0}
+            disabled={safeCues.length === 0 || safeIndex === 0}
             onClick={() => {
               setIsPlaying(false);
               setPauseRemainingMs(0);
@@ -573,9 +639,9 @@ export function CinemaPreview({
           <input
             type="range"
             min={0}
-            max={Math.max(0, cues.length - 1)}
+            max={Math.max(0, safeCues.length - 1)}
             value={safeIndex}
-            disabled={cues.length === 0}
+            disabled={safeCues.length === 0}
             onChange={(e) => {
               setIsPlaying(false);
               setPauseRemainingMs(0);

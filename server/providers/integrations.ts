@@ -16,11 +16,15 @@ import type {
 import { DEFAULT_GEMINI_MODEL } from '../db/store.ts';
 
 export const DEFAULT_PROVIDER_TIMEOUT_MS = 10000;
+export const MAX_DOWNLOAD_BYTES = 10 * 1024 * 1024; // 10 MB max raw download
+export const MAX_DECOMPRESSED_BYTES = 10 * 1024 * 1024; // 10 MB max decompressed payload
 
 export interface ProviderDeps {
   fetchFn?: typeof fetch;
   timeoutMs?: number;
   geminiCheckFn?: (apiKey: string) => Promise<void>;
+  maxDownloadBytes?: number;
+  maxDecompressedBytes?: number;
 }
 
 export class ProviderRequestError extends Error {
@@ -800,12 +804,16 @@ export async function downloadOpenSubtitleFile(
       );
     }
 
-    const arrBuf = await fileRes.arrayBuffer();
-    const rawBuffer = Buffer.from(arrBuf);
+    const rawBuffer = await readResponseBufferWithLimit(
+      fileRes,
+      'OpenSubtitles',
+      deps?.maxDownloadBytes ?? MAX_DOWNLOAD_BYTES,
+    );
     const unwrapped = unwrapDownloadedSubtitlePayload(
       rawBuffer,
       data.file_name || `opensubtitles_${cleanId}.srt`,
       'OpenSubtitles',
+      deps?.maxDecompressedBytes ?? MAX_DECOMPRESSED_BYTES,
     );
     recordProviderSuccess('opensubtitles');
     return unwrapped;
@@ -1053,95 +1061,369 @@ export async function searchAllSubtitleProviders(
   };
 }
 
+function isSizeLimitError(err: unknown): boolean {
+  if (!err || typeof err !== 'object') return false;
+  const code = (err as { code?: string }).code;
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    code === 'ERR_BUFFER_TOO_LARGE' ||
+    /Cannot create a Buffer larger than|maxOutputLength|length.*limit/i.test(msg)
+  );
+}
+
+async function readResponseBufferWithLimit(
+  res: Response,
+  providerLabel: string,
+  maxBytes: number,
+): Promise<Buffer> {
+  const contentLengthHeader = res.headers?.get?.('content-length');
+  if (contentLengthHeader) {
+    const declared = Number(contentLengthHeader);
+    if (Number.isFinite(declared) && declared > maxBytes) {
+      throw new ProviderRequestError(
+        `${providerLabel} download exceeded maximum allowed size (${maxBytes} bytes).`,
+        'upstream',
+      );
+    }
+  }
+  const arrBuf = await res.arrayBuffer();
+  const buf = Buffer.from(arrBuf);
+  if (buf.length > maxBytes) {
+    throw new ProviderRequestError(
+      `${providerLabel} download exceeded maximum allowed size (${maxBytes} bytes).`,
+      'upstream',
+    );
+  }
+  return buf;
+}
+
+function assertValidSubtitleTextPayload(buffer: Buffer, providerLabel: string): void {
+  if (buffer.length === 0) {
+    throw new ProviderRequestError(
+      `${providerLabel} returned an empty subtitle file.`,
+      'upstream',
+    );
+  }
+
+  // Strip optional UTF-8 BOM before inspecting header
+  const textSample = buffer
+    .subarray(0, 4096)
+    .toString('utf8')
+    .replace(/^\uFEFF/, '')
+    .trimStart();
+  const lowerHead = textSample.slice(0, 512).toLowerCase();
+
+  // Reject HTML / XML error walls disguised as 200 OK downloads
+  if (
+    lowerHead.startsWith('<!doctype html') ||
+    lowerHead.startsWith('<html') ||
+    lowerHead.startsWith('<head') ||
+    lowerHead.startsWith('<body') ||
+    lowerHead.startsWith('<title') ||
+    lowerHead.startsWith('<script') ||
+    (lowerHead.startsWith('<!--') && lowerHead.includes('<html')) ||
+    (lowerHead.startsWith('<?xml') && /<error\b/i.test(lowerHead)) ||
+    lowerHead.startsWith('<error>')
+  ) {
+    throw new ProviderRequestError(
+      `${providerLabel} returned an HTML error page instead of a subtitle file.`,
+      'upstream',
+    );
+  }
+
+  // Reject JSON error payloads disguised as subtitle files
+  if (textSample.startsWith('{') || textSample.startsWith('[')) {
+    const fullTrimmed = buffer
+      .toString('utf8')
+      .replace(/^\uFEFF/, '')
+      .trim();
+    try {
+      const parsed = JSON.parse(fullTrimmed) as Record<string, unknown>;
+      if (parsed && typeof parsed === 'object') {
+        const rawDetail =
+          !Array.isArray(parsed) && typeof parsed.error === 'string'
+            ? parsed.error
+            : !Array.isArray(parsed) && typeof parsed.message === 'string'
+              ? parsed.message
+              : '';
+        const safeDetail = rawDetail ? sanitizeProviderMessage(rawDetail).slice(0, 180) : '';
+        const isAuth = /api.?key|invalid|unauthoriz|expired|forbidden/i.test(safeDetail);
+        const isRate = /rate|limit|quota|too many/i.test(safeDetail);
+        throw new ProviderRequestError(
+          `${providerLabel} returned a JSON response instead of a subtitle file${safeDetail ? `: ${safeDetail}` : '.'}`,
+          isRate ? 'rate_limit' : isAuth ? 'auth' : 'upstream',
+        );
+      }
+    } catch (err) {
+      if (err instanceof ProviderRequestError) throw err;
+      // Not valid JSON (e.g. ASS override tag `{...}` at start of dialogue) — allow through
+    }
+  }
+}
+
+interface ZipSubtitleCandidate {
+  fileName: string;
+  compression: number;
+  compressedSize: number;
+  uncompressedSize: number;
+  dataStart: number;
+  dataEnd: number;
+  order: number;
+}
+
+function isIgnorableZipEntry(fileName: string): boolean {
+  const normalized = fileName.replace(/\\/g, '/');
+  if (!normalized || normalized.endsWith('/')) return true;
+  if (normalized.startsWith('__MACOSX/') || normalized.includes('/__MACOSX/')) return true;
+  const baseName = normalized.split('/').pop() || '';
+  if (baseName.startsWith('._')) return true;
+  return false;
+}
+
 /**
- * Extracts the first readable subtitle file (.srt/.vtt/.ass/.ssa) from a ZIP archive.
- * Parses the ZIP Central Directory first (supporting directory entries and bit-3 data descriptors),
- * then falls back to scanning Local File Headers cleanly without aborting on zero-byte entries.
+ * Extracts the best readable subtitle file (.srt/.vtt/.ass/.ssa) from a ZIP archive.
+ * Parses the ZIP Central Directory first (supporting directory entries, multiple subtitle files,
+ * and bit-3 data descriptors), then falls back to scanning Local File Headers safely.
+ * Enforces decompression size limits and surfaces clear ProviderRequestErrors on corrupt,
+ * truncated, unsupported, or oversized archives.
  */
-function extractSubtitleFromZip(zipBuffer: Buffer): { buffer: Buffer; fileName: string } | null {
+function extractSubtitleFromZip(
+  zipBuffer: Buffer,
+  providerLabel: string,
+  maxDecompressedBytes: number,
+): { buffer: Buffer; fileName: string } {
   const isSubtitleName = (name: string) => /\.(srt|vtt|ass|ssa)$/i.test(name);
+  const candidates: ZipSubtitleCandidate[] = [];
+  let sawValidArchiveStructure = false;
+  let sawTruncatedEntry = false;
+  let order = 0;
 
   // 1. Central Directory lookup via End of Central Directory (0x06054b50)
-  const minEocdOffset = Math.max(0, zipBuffer.length - 65557);
-  for (let pos = zipBuffer.length - 22; pos >= minEocdOffset; pos--) {
-    if (zipBuffer.readUInt32LE(pos) !== 0x06054b50) continue;
-    const cdSize = zipBuffer.readUInt32LE(pos + 12);
-    const cdOffset = zipBuffer.readUInt32LE(pos + 16);
-    if (cdOffset + cdSize > zipBuffer.length) break;
+  let parsedCentralDirectory = false;
+  if (zipBuffer.length >= 22) {
+    const minEocdOffset = Math.max(0, zipBuffer.length - 65557);
+    for (let pos = zipBuffer.length - 22; pos >= minEocdOffset; pos--) {
+      if (zipBuffer.readUInt32LE(pos) !== 0x06054b50) continue;
+      const cdSize = zipBuffer.readUInt32LE(pos + 12);
+      const cdOffset = zipBuffer.readUInt32LE(pos + 16);
+      if (cdOffset + cdSize > zipBuffer.length) {
+        sawTruncatedEntry = true;
+        break;
+      }
 
-    let cdPos = cdOffset;
-    while (cdPos + 46 <= cdOffset + cdSize) {
-      if (zipBuffer.readUInt32LE(cdPos) !== 0x02014b50) break;
-      const compression = zipBuffer.readUInt16LE(cdPos + 10);
-      const compressedSize = zipBuffer.readUInt32LE(cdPos + 20);
-      const nameLen = zipBuffer.readUInt16LE(cdPos + 28);
-      const extraLen = zipBuffer.readUInt16LE(cdPos + 30);
-      const commentLen = zipBuffer.readUInt16LE(cdPos + 32);
-      const localHeaderOffset = zipBuffer.readUInt32LE(cdPos + 42);
-      const fileName = zipBuffer
-        .subarray(cdPos + 46, cdPos + 46 + nameLen)
-        .toString('utf8');
-      cdPos += 46 + nameLen + extraLen + commentLen;
+      parsedCentralDirectory = true;
+      sawValidArchiveStructure = true;
+      const cdEnd = cdOffset + cdSize;
+      let cdPos = cdOffset;
+      while (cdPos + 46 <= cdEnd) {
+        if (zipBuffer.readUInt32LE(cdPos) !== 0x02014b50) {
+          sawTruncatedEntry = true;
+          break;
+        }
+        const compression = zipBuffer.readUInt16LE(cdPos + 10);
+        const compressedSize = zipBuffer.readUInt32LE(cdPos + 20);
+        const uncompressedSize = zipBuffer.readUInt32LE(cdPos + 24);
+        const nameLen = zipBuffer.readUInt16LE(cdPos + 28);
+        const extraLen = zipBuffer.readUInt16LE(cdPos + 30);
+        const commentLen = zipBuffer.readUInt16LE(cdPos + 32);
+        const localHeaderOffset = zipBuffer.readUInt32LE(cdPos + 42);
+        const entryEnd = cdPos + 46 + nameLen + extraLen + commentLen;
+        if (entryEnd > cdEnd) {
+          sawTruncatedEntry = true;
+          break;
+        }
+        const fileName = zipBuffer.subarray(cdPos + 46, cdPos + 46 + nameLen).toString('utf8');
+        cdPos = entryEnd;
 
-      if (
-        !fileName.endsWith('/') &&
-        isSubtitleName(fileName) &&
-        compressedSize > 0 &&
-        localHeaderOffset + 30 <= zipBuffer.length &&
-        zipBuffer.readUInt32LE(localHeaderOffset) === 0x04034b50
-      ) {
+        if (isIgnorableZipEntry(fileName) || !isSubtitleName(fileName)) {
+          continue;
+        }
+
+        if (
+          localHeaderOffset + 30 > zipBuffer.length ||
+          zipBuffer.readUInt32LE(localHeaderOffset) !== 0x04034b50
+        ) {
+          sawTruncatedEntry = true;
+          continue;
+        }
         const lNameLen = zipBuffer.readUInt16LE(localHeaderOffset + 26);
         const lExtraLen = zipBuffer.readUInt16LE(localHeaderOffset + 28);
         const dataStart = localHeaderOffset + 30 + lNameLen + lExtraLen;
         const dataEnd = dataStart + compressedSize;
-        if (dataEnd <= zipBuffer.length) {
-          const compressedData = zipBuffer.subarray(dataStart, dataEnd);
-          if (compression === 0) return { buffer: compressedData, fileName };
-          if (compression === 8) return { buffer: zlib.inflateRawSync(compressedData), fileName };
+        if (dataStart > zipBuffer.length || dataEnd > zipBuffer.length) {
+          sawTruncatedEntry = true;
+          continue;
         }
+        if (compressedSize === 0 && uncompressedSize === 0) {
+          continue;
+        }
+
+        candidates.push({
+          fileName,
+          compression,
+          compressedSize,
+          uncompressedSize,
+          dataStart,
+          dataEnd,
+          order: order++,
+        });
       }
+      break;
     }
-    break;
   }
 
-  // 2. Local File Header fallback scan (does not break on zero-length directory entries)
-  let offset = 0;
-  while (offset + 30 <= zipBuffer.length) {
-    const sig = zipBuffer.readUInt32LE(offset);
-    if (sig !== 0x04034b50) break;
+  // 2. Local File Header fallback scan when Central Directory is absent/truncated
+  if (!parsedCentralDirectory) {
+    let offset = 0;
+    while (offset + 30 <= zipBuffer.length) {
+      const sig = zipBuffer.readUInt32LE(offset);
+      if (sig !== 0x04034b50) break;
+      sawValidArchiveStructure = true;
 
-    const compression = zipBuffer.readUInt16LE(offset + 8);
-    const compressedSize = zipBuffer.readUInt32LE(offset + 18);
-    const fileNameLength = zipBuffer.readUInt16LE(offset + 26);
-    const extraLength = zipBuffer.readUInt16LE(offset + 28);
+      const flags = zipBuffer.readUInt16LE(offset + 6);
+      const compression = zipBuffer.readUInt16LE(offset + 8);
+      const compressedSize = zipBuffer.readUInt32LE(offset + 18);
+      const uncompressedSize = zipBuffer.readUInt32LE(offset + 22);
+      const fileNameLength = zipBuffer.readUInt16LE(offset + 26);
+      const extraLength = zipBuffer.readUInt16LE(offset + 28);
 
-    const nameStart = offset + 30;
-    const nameEnd = nameStart + fileNameLength;
-    if (nameEnd > zipBuffer.length) break;
-    const fileName = zipBuffer.subarray(nameStart, nameEnd).toString('utf8');
-    const dataStart = nameEnd + extraLength;
-    const dataEnd = dataStart + compressedSize;
-    if (dataEnd > zipBuffer.length) break;
-
-    if (compressedSize > 0 && isSubtitleName(fileName)) {
-      const compressedData = zipBuffer.subarray(dataStart, dataEnd);
-      if (compression === 0) {
-        return { buffer: compressedData, fileName };
+      const nameStart = offset + 30;
+      const nameEnd = nameStart + fileNameLength;
+      if (nameEnd > zipBuffer.length) {
+        sawTruncatedEntry = true;
+        break;
       }
-      if (compression === 8) {
-        return { buffer: zlib.inflateRawSync(compressedData), fileName };
+      const fileName = zipBuffer.subarray(nameStart, nameEnd).toString('utf8');
+      const dataStart = nameEnd + extraLength;
+      const dataEnd = dataStart + compressedSize;
+      if (dataStart > zipBuffer.length || dataEnd > zipBuffer.length) {
+        sawTruncatedEntry = true;
+        break;
       }
+
+      // Bit-3 data descriptor without central directory means local compressedSize is 0 (cannot determine bounds)
+      if ((flags & 0x0008) !== 0 && compressedSize === 0) {
+        sawTruncatedEntry = true;
+        break;
+      }
+
+      if (!isIgnorableZipEntry(fileName) && isSubtitleName(fileName) && compressedSize > 0) {
+        candidates.push({
+          fileName,
+          compression,
+          compressedSize,
+          uncompressedSize,
+          dataStart,
+          dataEnd,
+          order: order++,
+        });
+      }
+
+      offset = dataEnd;
+    }
+  }
+
+  if (candidates.length === 0) {
+    if (sawTruncatedEntry || !sawValidArchiveStructure) {
+      throw new ProviderRequestError(
+        `Downloaded ${providerLabel} ZIP archive is corrupt or truncated.`,
+        'upstream',
+      );
+    }
+    throw new ProviderRequestError(
+      `Downloaded ${providerLabel} archive did not contain a readable SRT/VTT/ASS file.`,
+      'upstream',
+    );
+  }
+
+  // Prefer larger subtitle entries when multiple subtitle files exist (e.g. full track over tiny forced track),
+  // while breaking ties by archive order.
+  const ranked = [...candidates].sort((a, b) => {
+    const sizeDiff = (b.uncompressedSize || b.compressedSize) - (a.uncompressedSize || a.compressedSize);
+    if (sizeDiff !== 0) return sizeDiff;
+    return a.order - b.order;
+  });
+
+  let unsupportedMethod: number | null = null;
+  let corruptFailure = false;
+  let lastPayloadError: ProviderRequestError | null = null;
+
+  for (const cand of ranked) {
+    if (cand.uncompressedSize > maxDecompressedBytes) {
+      throw new ProviderRequestError(
+        `Downloaded ${providerLabel} subtitle exceeded maximum allowed decompressed size (${maxDecompressedBytes} bytes).`,
+        'upstream',
+      );
     }
 
-    offset = dataEnd;
+    const compressedData = zipBuffer.subarray(cand.dataStart, cand.dataEnd);
+    let extractedBuffer: Buffer;
+
+    if (cand.compression === 0) {
+      if (compressedData.length > maxDecompressedBytes) {
+        throw new ProviderRequestError(
+          `Downloaded ${providerLabel} subtitle exceeded maximum allowed decompressed size (${maxDecompressedBytes} bytes).`,
+          'upstream',
+        );
+      }
+      extractedBuffer = Buffer.from(compressedData);
+    } else if (cand.compression === 8) {
+      try {
+        extractedBuffer = zlib.inflateRawSync(compressedData, {
+          maxOutputLength: maxDecompressedBytes,
+        });
+      } catch (err: unknown) {
+        if (isSizeLimitError(err)) {
+          throw new ProviderRequestError(
+            `Downloaded ${providerLabel} subtitle exceeded maximum allowed decompressed size (${maxDecompressedBytes} bytes).`,
+            'upstream',
+          );
+        }
+        corruptFailure = true;
+        continue;
+      }
+    } else {
+      unsupportedMethod = cand.compression;
+      continue;
+    }
+
+    try {
+      assertValidSubtitleTextPayload(extractedBuffer, providerLabel);
+      return { buffer: extractedBuffer, fileName: cand.fileName };
+    } catch (err: unknown) {
+      if (err instanceof ProviderRequestError) {
+        lastPayloadError = err;
+      }
+      continue;
+    }
   }
-  return null;
+
+  if (unsupportedMethod !== null && !corruptFailure && !lastPayloadError) {
+    throw new ProviderRequestError(
+      `Downloaded ${providerLabel} ZIP archive uses an unsupported compression method (${unsupportedMethod}).`,
+      'upstream',
+    );
+  }
+  if (corruptFailure) {
+    throw new ProviderRequestError(
+      `Downloaded ${providerLabel} ZIP archive contains corrupt or truncated subtitle data.`,
+      'upstream',
+    );
+  }
+  if (lastPayloadError) {
+    throw lastPayloadError;
+  }
+  throw new ProviderRequestError(
+    `Downloaded ${providerLabel} archive did not contain a readable SRT/VTT/ASS file.`,
+    'upstream',
+  );
 }
 
 function unwrapDownloadedSubtitlePayload(
   rawBuffer: Buffer,
   fallbackFileName: string,
   providerLabel: string,
+  maxDecompressedBytes: number = MAX_DECOMPRESSED_BYTES,
 ): { buffer: Buffer; fileName: string } {
   if (rawBuffer.length === 0) {
     throw new ProviderRequestError(
@@ -1150,35 +1432,49 @@ function unwrapDownloadedSubtitlePayload(
     );
   }
 
-  // ZIP archive (PK\x03\x04)
-  if (rawBuffer.length >= 4 && rawBuffer[0] === 0x50 && rawBuffer[1] === 0x4b) {
-    const extracted = extractSubtitleFromZip(rawBuffer);
-    if (!extracted) {
-      throw new ProviderRequestError(
-        `Downloaded ${providerLabel} archive did not contain a readable SRT/VTT/ASS file.`,
-        'upstream',
-      );
-    }
-    return extracted;
+  // ZIP archive (PK\x03\x04 or empty ZIP PK\x05\x06)
+  if (
+    rawBuffer.length >= 4 &&
+    rawBuffer[0] === 0x50 &&
+    rawBuffer[1] === 0x4b &&
+    ((rawBuffer[2] === 0x03 && rawBuffer[3] === 0x04) ||
+      (rawBuffer[2] === 0x05 && rawBuffer[3] === 0x06))
+  ) {
+    return extractSubtitleFromZip(rawBuffer, providerLabel, maxDecompressedBytes);
   }
 
   // GZIP stream (\x1f\x8b)
-  if (rawBuffer.length >= 3 && rawBuffer[0] === 0x1f && rawBuffer[1] === 0x8b) {
-    const inflated = zlib.gunzipSync(rawBuffer);
+  if (rawBuffer.length >= 2 && rawBuffer[0] === 0x1f && rawBuffer[1] === 0x8b) {
+    let inflated: Buffer;
+    try {
+      inflated = zlib.gunzipSync(rawBuffer, { maxOutputLength: maxDecompressedBytes });
+    } catch (err: unknown) {
+      if (isSizeLimitError(err)) {
+        throw new ProviderRequestError(
+          `Downloaded ${providerLabel} GZIP subtitle exceeded maximum allowed decompressed size (${maxDecompressedBytes} bytes).`,
+          'upstream',
+        );
+      }
+      throw new ProviderRequestError(
+        `Downloaded ${providerLabel} GZIP archive is corrupt or truncated.`,
+        'upstream',
+      );
+    }
+    assertValidSubtitleTextPayload(inflated, providerLabel);
     return {
       buffer: inflated,
       fileName: fallbackFileName.replace(/\.gz$/i, '') || 'subtitle.srt',
     };
   }
 
-  // Reject HTML error / rate-limit walls disguised as 200 OK
-  const head = rawBuffer.subarray(0, 256).toString('utf8').trimStart().toLowerCase();
-  if (head.startsWith('<!doctype html') || head.startsWith('<html')) {
+  if (rawBuffer.length > maxDecompressedBytes) {
     throw new ProviderRequestError(
-      `${providerLabel} returned an HTML error page instead of a subtitle file.`,
+      `Downloaded ${providerLabel} subtitle exceeded maximum allowed size (${maxDecompressedBytes} bytes).`,
       'upstream',
     );
   }
+
+  assertValidSubtitleTextPayload(rawBuffer, providerLabel);
 
   return {
     buffer: rawBuffer,
@@ -1199,7 +1495,12 @@ export async function downloadSubdlFile(
   const baseUrl = downloadPath.startsWith('http')
     ? downloadPath
     : `https://dl.subdl.com${downloadPath.startsWith('/') ? '' : '/'}${downloadPath}`;
-  const urlObj = new URL(baseUrl);
+  let urlObj: URL;
+  try {
+    urlObj = new URL(baseUrl);
+  } catch {
+    throw new ProviderRequestError('SubDL download URL is malformed.', 'upstream', 400);
+  }
   const subdlKey = process.env.SUBDL_API_KEY?.trim();
   if (subdlKey && urlObj.hostname.endsWith('subdl.com') && !urlObj.searchParams.has('api_key')) {
     urlObj.searchParams.set('api_key', subdlKey);
@@ -1216,11 +1517,16 @@ export async function downloadSubdlFile(
       );
     }
 
-    const buffer = Buffer.from(await res.arrayBuffer());
+    const buffer = await readResponseBufferWithLimit(
+      res,
+      'SubDL',
+      deps?.maxDownloadBytes ?? MAX_DOWNLOAD_BYTES,
+    );
     const unwrapped = unwrapDownloadedSubtitlePayload(
       buffer,
       downloadPath.split('/').pop() || 'subdl_subtitle.srt',
       'SubDL',
+      deps?.maxDecompressedBytes ?? MAX_DECOMPRESSED_BYTES,
     );
     recordProviderSuccess('subdl');
     return unwrapped;

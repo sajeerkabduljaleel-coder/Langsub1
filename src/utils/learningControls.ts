@@ -1,4 +1,9 @@
-import type { TriLineCue } from '../types/subtitle';
+import type { SubtitleLineRole, TriLineCue } from '../types/subtitle';
+
+export type ManualWordSelection = {
+  role: SubtitleLineRole;
+  index: number;
+} | null;
 
 const CJK_OR_KANA_CHAR_REGEX =
   /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af]/;
@@ -9,6 +14,7 @@ const CJK_OR_KANA_CHAR_REGEX =
  * - Unspaced CJK strings (Japanese kana/kanji, Mandarin Hanzi, Korean without spaces) segment into character/script-cluster tokens so word-level highlighting works naturally across scripts.
  */
 export function tokenizeCueWords(text: string): string[] {
+  if (typeof text !== 'string') return [];
   const normalized = text.replace(/\r?\n/g, ' ').replace(/\s{2,}/g, ' ').trim();
   if (!normalized) return [];
 
@@ -60,9 +66,10 @@ export function getActiveWordIndex(
   elapsedMs: number,
   durationMs: number,
 ): number {
-  if (tokens.length === 0) return -1;
-  if (durationMs <= 0) return 0;
-  const clampedElapsed = Math.max(0, Math.min(durationMs - 1, elapsedMs));
+  if (!Array.isArray(tokens) || tokens.length === 0) return -1;
+  if (!Number.isFinite(durationMs) || durationMs <= 0) return 0;
+  const safeElapsed = Number.isFinite(elapsedMs) ? elapsedMs : 0;
+  const clampedElapsed = Math.max(0, Math.min(durationMs - 1, safeElapsed));
   const ratio = clampedElapsed / durationMs;
   return Math.min(tokens.length - 1, Math.max(0, Math.floor(ratio * tokens.length)));
 }
@@ -71,10 +78,87 @@ export function computeEffectiveCueDurationMs(
   cue: Pick<TriLineCue, 'startMs' | 'endMs'> | null | undefined,
   playbackSpeed: number,
 ): number {
-  const safeSpeed = Math.max(0.5, Math.min(2, playbackSpeed || 1));
-  const rawDuration = cue ? Math.max(600, cue.endMs - cue.startMs) : 2600;
+  const numericSpeed =
+    typeof playbackSpeed === 'number' && Number.isFinite(playbackSpeed) && playbackSpeed > 0
+      ? playbackSpeed
+      : 1;
+  const safeSpeed = Math.max(0.5, Math.min(2, numericSpeed));
+  const hasValidSpan =
+    Boolean(cue) &&
+    typeof cue!.startMs === 'number' &&
+    Number.isFinite(cue!.startMs) &&
+    typeof cue!.endMs === 'number' &&
+    Number.isFinite(cue!.endMs);
+  const rawDuration = hasValidSpan ? Math.max(600, cue!.endMs - cue!.startMs) : 2600;
   const boundedBase = Math.max(1200, Math.min(8000, rawDuration));
   return Math.round(boundedBase / safeSpeed);
+}
+
+/**
+ * Preserves relative progress inside the current cue when playbackSpeed changes mid-cue,
+ * preventing abrupt word highlight jumps or premature cue skipping.
+ */
+export function rescaleElapsedForSpeedChange(
+  elapsedMs: number,
+  previousDurationMs: number,
+  nextDurationMs: number,
+): number {
+  if (
+    !Number.isFinite(elapsedMs) ||
+    elapsedMs <= 0 ||
+    !Number.isFinite(previousDurationMs) ||
+    previousDurationMs <= 0 ||
+    !Number.isFinite(nextDurationMs) ||
+    nextDurationMs <= 0
+  ) {
+    return 0;
+  }
+  const ratio = Math.max(0, Math.min(0.9999, elapsedMs / previousDurationMs));
+  return Math.min(Math.max(0, nextDurationMs - 1), Math.round(ratio * nextDurationMs));
+}
+
+/**
+ * Resolves which word index (or -1 for none) should be highlighted for a specific subtitle line.
+ * - Guarantees that selecting a manual word in one line NEVER highlights a word in any other line.
+ * - Preserves current word position when paused mid-cue without a manual override.
+ */
+export function resolveLineActiveWordIndex(params: {
+  highlightWords: boolean;
+  lineRole: SubtitleLineRole;
+  tokens: string[];
+  isPlaying: boolean;
+  pauseRemainingMs: number;
+  elapsedMs: number;
+  effectiveDurationMs: number;
+  manualWord: ManualWordSelection;
+}): number {
+  const {
+    highlightWords,
+    lineRole,
+    tokens,
+    isPlaying,
+    pauseRemainingMs,
+    elapsedMs,
+    effectiveDurationMs,
+    manualWord,
+  } = params;
+
+  if (!highlightWords || !Array.isArray(tokens) || tokens.length === 0) {
+    return -1;
+  }
+
+  if (isPlaying && pauseRemainingMs === 0) {
+    return getActiveWordIndex(tokens, elapsedMs, effectiveDurationMs);
+  }
+
+  if (manualWord !== null) {
+    if (manualWord.role !== lineRole) {
+      return -1;
+    }
+    return manualWord.index >= 0 && manualWord.index < tokens.length ? manualWord.index : -1;
+  }
+
+  return getActiveWordIndex(tokens, elapsedMs, effectiveDurationMs);
 }
 
 export interface CueTickTransition {
@@ -144,3 +228,4 @@ export function resolveCueTickCompletion(params: {
     nextPauseRemainingMs: 0,
   };
 }
+

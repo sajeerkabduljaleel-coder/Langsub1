@@ -27,7 +27,9 @@ const IPA_FORBIDDEN_REGEX =
 
 // Non-Latin scripts that must NEVER leak into English-intuitive phonetic lines
 const NON_LATIN_SCRIPT_REGEX =
-  /[\u1100-\u11ff\u3040-\u30ff\u3130-\u318f\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\u0400-\u04ff\u0590-\u05ff\u0600-\u06ff\u0900-\u097f]/;
+  /[\u0370-\u03ff\u0400-\u04ff\u0590-\u05ff\u0600-\u06ff\u0750-\u077f\u08a0-\u08ff\u0900-\u0d7f\u0e00-\u0e7f\u1100-\u11ff\u3040-\u30ff\u3130-\u318f\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff\ufb50-\ufdff\ufe70-\ufeff\uff65-\uff9f]/;
+
+const SLASH_IPA_REGEX = /(?:^|\s)\/[^/\s]+\/(?:[\s.,!?;:]|$)/;
 
 function getAiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
@@ -269,7 +271,7 @@ function validateAndNormalizeBatchItems(
     if (!rawPhonetic) {
       throw new Error(`Empty phoneticText returned for cue ${item.index}`);
     }
-    if (/^\/.*\/$/.test(rawPhonetic)) {
+    if (SLASH_IPA_REGEX.test(rawPhonetic)) {
       throw new Error(`Slash-delimited IPA notation detected in phonetic output for cue ${item.index}`);
     }
     if (IPA_FORBIDDEN_REGEX.test(rawPhonetic)) {
@@ -318,6 +320,24 @@ function validateAndNormalizeBatchItems(
   });
 }
 
+function isNonRetryableApiError(err: unknown): boolean {
+  const status =
+    err && typeof err === 'object' && 'status' in err
+      ? Number((err as { status?: unknown }).status)
+      : NaN;
+  if (status === 401 || status === 403 || status === 404) {
+    return true;
+  }
+  const msg = err instanceof Error ? err.message : String(err);
+  return (
+    msg.includes('API_KEY_INVALID') ||
+    msg.includes('PERMISSION_DENIED') ||
+    msg.includes('UNAUTHENTICATED') ||
+    msg.includes('NOT_FOUND') ||
+    /\b(?:HTTP|status)\s*[:=]?\s*(?:401|403)\b/i.test(msg)
+  );
+}
+
 async function callGeminiBatchWithRetry(
   generateFn: GenerateBatchPayloadFn,
   systemInstruction: string,
@@ -361,15 +381,8 @@ async function callGeminiBatchWithRetry(
       return validateAndNormalizeBatchItems(rawText, batch);
     } catch (err: unknown) {
       lastError = err;
-      const msg = err instanceof Error ? err.message : String(err);
-      // Do not retry hard auth/config errors
-      if (
-        msg.includes('API_KEY_INVALID') ||
-        msg.includes('PERMISSION_DENIED') ||
-        msg.includes('403') ||
-        msg.includes('401') ||
-        msg.includes('NOT_FOUND')
-      ) {
+      // Do not retry hard auth/config errors (never match numeric cue indices like 401/403)
+      if (isNonRetryableApiError(err)) {
         throw err;
       }
       if (attempt < MAX_RETRIES - 1 && retryDelayBaseMs > 0) {
@@ -457,6 +470,10 @@ export async function processTriLineConversion(params: {
     const t = targetText.trim();
     const p = phoneticText.trim();
     if (!t || !p) return;
+    // Refresh recency (LRU) so recurring phrases/names persist across very long files
+    if (glossaryMap.has(t)) {
+      glossaryMap.delete(t);
+    }
     glossaryMap.set(t, { baseText: b, phoneticText: p });
     if (glossaryMap.size > 30) {
       const oldestKey = glossaryMap.keys().next().value;
@@ -556,7 +573,21 @@ export async function processTriLineConversion(params: {
             : params.cues[ci],
         );
       }
-      const contextAfter = params.cues.slice(lastIdx + 1, Math.min(totalCues, lastIdx + 3));
+      const contextAfter: BatchInputCue[] = [];
+      for (let ci = lastIdx + 1; ci < Math.min(totalCues, lastIdx + 3); ci++) {
+        const resolved = results[ci];
+        contextAfter.push(
+          resolved
+            ? {
+                index: resolved.index,
+                startMs: resolved.startMs,
+                endMs: resolved.endMs,
+                baseText: resolved.baseText,
+                targetText: resolved.targetText,
+              }
+            : params.cues[ci],
+        );
+      }
       const glossaryEntries = Array.from(glossaryMap.entries()).map(
         ([targetText, entry]) => ({
           baseText: entry.baseText,
