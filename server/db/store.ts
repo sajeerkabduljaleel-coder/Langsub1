@@ -19,7 +19,7 @@ import {
 } from '../validation/projectValidation.ts';
 
 export const DEFAULT_GEMINI_MODEL = 'gemini-4-hydrogen';
-export const DEFAULT_PROMPT_VERSION = 'v3';
+export const DEFAULT_PROMPT_VERSION = 'v4';
 
 export interface LineCacheEntry {
   baseText: string;

@@ -87,27 +87,136 @@ function structuralCompatibility(targetText: string, baseText: string): number {
   return Math.min(1, 0.45 + 0.55 * lenRatio + bonus);
 }
 
+export interface GlobalTimeTransform {
+  scale: number;
+  offsetMs: number;
+}
+
+interface CandidateMatchStats {
+  score: number;
+  inliers: Array<{ tMid: number; bMid: number; iou: number }>;
+}
+
 /**
- * Estimates a global timing offset (targetMs - baseMs) via consensus delta
- * clustering up to +/- 60 seconds, handling large recap/intro shifts accurately.
+ * Evaluates a candidate affine time transform (targetMs ≈ scale * baseMs + offsetMs)
+ * using monotonic 1-to-1 cue matching over sampled target cues so periodic cues
+ * cannot falsely alias onto an off-by-one shift.
  */
-export function estimateGlobalOffsetMs(targetCues: RawCue[], baseCues: RawCue[]): number {
-  if (targetCues.length === 0 || baseCues.length === 0) return 0;
+function scoreTimeTransform(
+  sampledTargets: RawCue[],
+  baseCues: RawCue[],
+  scale: number,
+  offsetMs: number,
+): CandidateMatchStats {
+  let score = 0;
+  let lastBaseIdx = -1;
+  const inliers: Array<{ tMid: number; bMid: number; iou: number }> = [];
+
+  for (const t of sampledTargets) {
+    const tMid = (t.startMs + t.endMs) / 2;
+    let bestScore = 0;
+    let bestIdx = -1;
+    let bestIoU = 0;
+    let bestBMid = 0;
+
+    for (let bIdx = lastBaseIdx + 1; bIdx < baseCues.length; bIdx++) {
+      const b = baseCues[bIdx];
+      const bStart = scale * b.startMs + offsetMs;
+      const bEnd = scale * b.endMs + offsetMs;
+      if (bStart > t.endMs + 2500) break;
+      if (bEnd < t.startMs - 2500) continue;
+
+      const iou = intervalIoU(t.startMs, t.endMs, bStart, bEnd);
+      const bMid = (bStart + bEnd) / 2;
+      const dist = Math.abs(tMid - bMid);
+      if (iou <= 0.05 && dist > 1500) continue;
+
+      const prox = Math.exp(-(dist * dist) / (2 * 850 * 850));
+      const struct = structuralCompatibility(t.text, b.text);
+      const pairScore = iou * 0.65 + prox * 0.25 + struct * 0.1;
+
+      if (pairScore > bestScore) {
+        bestScore = pairScore;
+        bestIdx = bIdx;
+        bestIoU = iou;
+        bestBMid = (b.startMs + b.endMs) / 2;
+      }
+    }
+
+    if (bestIdx >= 0 && (bestIoU >= 0.12 || bestScore >= 0.45)) {
+      score += bestScore;
+      lastBaseIdx = bestIdx;
+      if (bestIoU >= 0.25 || bestScore >= 0.55) {
+        inliers.push({ tMid, bMid: bestBMid, iou: bestIoU });
+      }
+    }
+  }
+
+  return { score, inliers };
+}
+
+function fitAffineFromInliers(
+  inliers: Array<{ tMid: number; bMid: number }>,
+): GlobalTimeTransform | null {
+  if (inliers.length < 3) return null;
+  const n = inliers.length;
+  let sumX = 0;
+  let sumY = 0;
+  for (const p of inliers) {
+    sumX += p.bMid;
+    sumY += p.tMid;
+  }
+  const meanX = sumX / n;
+  const meanY = sumY / n;
+
+  let num = 0;
+  let den = 0;
+  for (const p of inliers) {
+    const dx = p.bMid - meanX;
+    num += dx * (p.tMid - meanY);
+    den += dx * dx;
+  }
+  if (den < 1e7) return null; // Requires meaningful time span (>= ~3s variance)
+
+  const scale = num / den;
+  const offsetMs = meanY - scale * meanX;
+  if (scale < 0.92 || scale > 1.08 || Math.abs(offsetMs) > 65000) return null;
+  return { scale, offsetMs };
+}
+
+/**
+ * Estimates a global time transform (`targetMs ≈ scale * baseMs + offsetMs`) supporting
+ * both constant offsets up to ±60s (recap/intro shifts) and progressive linear drift
+ * (e.g., 23.976fps ↔ 25fps framerate mismatches).
+ */
+export function estimateGlobalTimeTransform(
+  targetCues: RawCue[],
+  baseCues: RawCue[],
+): GlobalTimeTransform {
+  if (targetCues.length === 0 || baseCues.length === 0) {
+    return { scale: 1, offsetMs: 0 };
+  }
 
   if (targetCues.length < 3 || baseCues.length < 3) {
-    if (targetCues.length !== baseCues.length) return 0;
+    if (targetCues.length !== baseCues.length) return { scale: 1, offsetMs: 0 };
     const t0 = targetCues[0];
     const b0 = baseCues[0];
-    if (intervalIoU(t0.startMs, t0.endMs, b0.startMs, b0.endMs) > 0.2) return 0;
+    if (intervalIoU(t0.startMs, t0.endMs, b0.startMs, b0.endMs) > 0.2) {
+      return { scale: 1, offsetMs: 0 };
+    }
     const tMid = (t0.startMs + t0.endMs) / 2;
     const bMid = (b0.startMs + b0.endMs) / 2;
     const diff = tMid - bMid;
     const durRatio =
       Math.min(t0.endMs - t0.startMs, b0.endMs - b0.startMs) /
       Math.max(1, Math.max(t0.endMs - t0.startMs, b0.endMs - b0.startMs));
-    return Math.abs(diff) > 150 && Math.abs(diff) <= 30000 && durRatio >= 0.7
-      ? Math.round(diff)
-      : 0;
+    return {
+      scale: 1,
+      offsetMs:
+        Math.abs(diff) > 150 && Math.abs(diff) <= 30000 && durRatio >= 0.7
+          ? Math.round(diff)
+          : 0,
+    };
   }
 
   const maxOffsetMs = 60000;
@@ -118,7 +227,11 @@ export function estimateGlobalOffsetMs(targetCues: RawCue[], baseCues: RawCue[])
   for (let i = 0; i < targetCues.length; i += step) {
     sampledTargets.push(targetCues[i]);
   }
+  if (sampledTargets[sampledTargets.length - 1] !== targetCues[targetCues.length - 1]) {
+    sampledTargets.push(targetCues[targetCues.length - 1]);
+  }
 
+  // Step 1: Collect top constant-offset candidates from weighted delta histogram
   const histogram = new Map<number, number>();
   const perTargetPairs: Array<Array<{ delta: number; weight: number }>> = [];
 
@@ -148,39 +261,165 @@ export function estimateGlobalOffsetMs(targetCues: RawCue[], baseCues: RawCue[])
     perTargetPairs.push(pairs);
   }
 
-  if (histogram.size === 0) return 0;
-
-  let peakBin = 0;
-  let peakWeight = -1;
-  for (const [bin, weight] of histogram.entries()) {
-    if (weight > peakWeight) {
-      peakWeight = weight;
-      peakBin = bin;
-    }
-  }
-
-  const supportingDeltas: number[] = [];
-  for (const pairs of perTargetPairs) {
-    let bestDelta: number | null = null;
-    let bestDist = Infinity;
-    for (const p of pairs) {
-      const dist = Math.abs(p.delta - peakBin);
-      if (dist <= 1200 && dist < bestDist) {
-        bestDist = dist;
-        bestDelta = p.delta;
+  // Extract up to 6 well-separated histogram peaks plus 0ms baseline
+  const sortedBins = Array.from(histogram.entries()).sort((a, b) => b[1] - a[1]);
+  const constantCandidates: number[] = [0];
+  for (const [bin] of sortedBins) {
+    if (constantCandidates.every((c) => Math.abs(c - bin) >= 1000)) {
+      const supporting: number[] = [];
+      for (const pairs of perTargetPairs) {
+        let bestDelta: number | null = null;
+        let bestDist = Infinity;
+        for (const p of pairs) {
+          const dist = Math.abs(p.delta - bin);
+          if (dist <= 1200 && dist < bestDist) {
+            bestDist = dist;
+            bestDelta = p.delta;
+          }
+        }
+        if (bestDelta !== null) supporting.push(bestDelta);
+      }
+      if (supporting.length >= Math.max(3, Math.floor(sampledTargets.length * 0.25))) {
+        supporting.sort((a, b) => a - b);
+        const median = Math.round(supporting[Math.floor(supporting.length / 2)]);
+        constantCandidates.push(Math.abs(median) > 150 ? median : 0);
       }
     }
-    if (bestDelta !== null) {
-      supportingDeltas.push(bestDelta);
+    if (constantCandidates.length >= 7) break;
+  }
+
+  let bestConstOffset = 0;
+  let bestConstStats = scoreTimeTransform(sampledTargets, baseCues, 1, 0);
+  // Small penalty for very large offsets so an aliased -8800ms shift cannot beat a genuine near-zero match on ties
+  const constAdjustedScore = (rawScore: number, offset: number) =>
+    rawScore - Math.min(0.15, Math.abs(offset) / 200000);
+  let bestConstAdj = constAdjustedScore(bestConstStats.score, 0);
+
+  for (const candOffset of constantCandidates) {
+    if (candOffset === 0) continue;
+    const stats = scoreTimeTransform(sampledTargets, baseCues, 1, candOffset);
+    const adj = constAdjustedScore(stats.score, candOffset);
+    if (adj > bestConstAdj) {
+      bestConstAdj = adj;
+      bestConstStats = stats;
+      bestConstOffset = candOffset;
     }
   }
 
-  const minSupport = Math.max(3, Math.floor(sampledTargets.length * 0.25));
-  if (supportingDeltas.length < minSupport) return 0;
+  // Step 2: Evaluate affine (scale + offset) drift candidates for framerate / clock drift
+  let bestAffine: GlobalTimeTransform | null = null;
+  let bestAffineStats: CandidateMatchStats | null = null;
 
-  supportingDeltas.sort((a, b) => a - b);
-  const median = supportingDeltas[Math.floor(supportingDeltas.length / 2)];
-  return Math.abs(median) > 150 ? Math.round(median) : 0;
+  const targetSpan =
+    targetCues[targetCues.length - 1].startMs - targetCues[0].startMs;
+  const baseSpan = baseCues[baseCues.length - 1].startMs - baseCues[0].startMs;
+
+  if (
+    targetCues.length >= 4 &&
+    baseCues.length >= 4 &&
+    targetSpan >= 10000 &&
+    baseSpan >= 10000
+  ) {
+    const headCount = Math.min(4, Math.ceil(targetCues.length * 0.25));
+    const tailCount = Math.min(4, Math.ceil(targetCues.length * 0.25));
+    const bHeadCount = Math.min(4, Math.ceil(baseCues.length * 0.25));
+    const bTailCount = Math.min(4, Math.ceil(baseCues.length * 0.25));
+
+    const startAnchors: Array<{ tMid: number; bMid: number }> = [];
+    for (let ti = 0; ti < headCount; ti++) {
+      const tMid = (targetCues[ti].startMs + targetCues[ti].endMs) / 2;
+      for (let bi = 0; bi < bHeadCount; bi++) {
+        const bMid = (baseCues[bi].startMs + baseCues[bi].endMs) / 2;
+        if (Math.abs(tMid - bMid) <= maxOffsetMs) {
+          startAnchors.push({ tMid, bMid });
+        }
+      }
+    }
+
+    const endAnchors: Array<{ tMid: number; bMid: number }> = [];
+    for (let ti = targetCues.length - tailCount; ti < targetCues.length; ti++) {
+      const tMid = (targetCues[ti].startMs + targetCues[ti].endMs) / 2;
+      for (let bi = baseCues.length - bTailCount; bi < baseCues.length; bi++) {
+        const bMid = (baseCues[bi].startMs + baseCues[bi].endMs) / 2;
+        endAnchors.push({ tMid, bMid });
+      }
+    }
+
+    for (const a of startAnchors) {
+      for (const b of endAnchors) {
+        const dB = b.bMid - a.bMid;
+        const dT = b.tMid - a.tMid;
+        if (dB < 8000 || dT < 8000) continue;
+
+        const scale = dT / dB;
+        if (scale < 0.92 || scale > 1.08) continue;
+        if (Math.abs(scale - 1) <= 0.002) continue;
+
+        const offsetMs = a.tMid - scale * a.bMid;
+        if (Math.abs(offsetMs) > maxOffsetMs) continue;
+
+        const stats = scoreTimeTransform(sampledTargets, baseCues, scale, offsetMs);
+        if (
+          !bestAffineStats ||
+          stats.score > bestAffineStats.score
+        ) {
+          bestAffine = { scale, offsetMs };
+          bestAffineStats = stats;
+        }
+      }
+    }
+
+    // Refine winning affine transform via least-squares fit over its inliers
+    if (bestAffine && bestAffineStats && bestAffineStats.inliers.length >= 3) {
+      const refined = fitAffineFromInliers(bestAffineStats.inliers);
+      if (refined) {
+        const refinedStats = scoreTimeTransform(
+          sampledTargets,
+          baseCues,
+          refined.scale,
+          refined.offsetMs,
+        );
+        if (refinedStats.score >= bestAffineStats.score - 0.05) {
+          bestAffine = refined;
+          bestAffineStats = refinedStats;
+        }
+      }
+    }
+  }
+
+  // Adopt affine drift only if it materially improves alignment over constant offset
+  if (
+    bestAffine &&
+    bestAffineStats &&
+    Math.abs(bestAffine.scale - 1) > 0.002 &&
+    bestAffineStats.inliers.length >= Math.max(4, Math.ceil(sampledTargets.length * 0.5)) &&
+    bestAffineStats.score > bestConstStats.score + 0.08 * sampledTargets.length
+  ) {
+    return {
+      scale: Number(bestAffine.scale.toFixed(6)),
+      offsetMs: Math.round(bestAffine.offsetMs),
+    };
+  }
+
+  return {
+    scale: 1,
+    offsetMs: bestConstOffset,
+  };
+}
+
+/**
+ * Estimates a global timing offset (targetMs - baseMs) via consensus delta
+ * clustering and monotonic validation up to +/- 60 seconds.
+ */
+export function estimateGlobalOffsetMs(targetCues: RawCue[], baseCues: RawCue[]): number {
+  const { scale, offsetMs } = estimateGlobalTimeTransform(targetCues, baseCues);
+  if (Math.abs(scale - 1) <= 0.002 || baseCues.length === 0) {
+    return offsetMs;
+  }
+  // Report effective offset at the track midpoint for summary statistics
+  const midBase =
+    (baseCues[0].startMs + baseCues[baseCues.length - 1].endMs) / 2;
+  return Math.round((scale - 1) * midBase + offsetMs);
 }
 
 /**
@@ -245,9 +484,10 @@ interface TargetAssignment {
 }
 
 /**
- * Aligns target-language and base-language subtitle cues using consensus global
- * offset estimation, temporal IoU, structural compatibility, 1-to-many and
- * many-to-one segmentation handling, while never silently discarding unmatched dialogue.
+ * Aligns target-language and base-language subtitle cues using affine global
+ * time-transform estimation (constant offset + framerate drift), temporal IoU,
+ * structural compatibility, 1-to-many and many-to-one segmentation handling,
+ * while never silently discarding unmatched dialogue.
  */
 export function alignDualSubtitles(
   targetCues: RawCue[],
@@ -257,14 +497,26 @@ export function alignDualSubtitles(
   const includeUnmatchedBase = options.includeUnmatchedBase !== false;
   const uncertainThreshold = options.uncertainThreshold ?? 0.65;
 
-  const estimatedOffsetMs = estimateGlobalOffsetMs(targetCues, baseCues);
+  const transform = estimateGlobalTimeTransform(targetCues, baseCues);
+  const estimatedOffsetMs =
+    Math.abs(transform.scale - 1) <= 0.002 || baseCues.length === 0
+      ? transform.offsetMs
+      : Math.round(
+          (transform.scale - 1) *
+            ((baseCues[0].startMs + baseCues[baseCues.length - 1].endMs) / 2) +
+            transform.offsetMs,
+        );
+
   const shiftedBase: ShiftedBaseCue[] = baseCues
     .map((b, bIdx) => {
-      const shiftedStart = Math.max(0, b.startMs + estimatedOffsetMs);
+      const rawDur = b.endMs > b.startMs ? Math.round((b.endMs - b.startMs) * transform.scale) : 200;
+      const rawStart = Math.round(b.startMs * transform.scale + transform.offsetMs);
+      const rawEnd = Math.round(b.endMs * transform.scale + transform.offsetMs);
+      const shiftedStart = Math.max(0, rawStart);
       const shiftedEnd =
-        b.endMs > b.startMs
-          ? Math.max(shiftedStart + 1, b.endMs + estimatedOffsetMs)
-          : shiftedStart + 200;
+        rawEnd > shiftedStart
+          ? rawEnd
+          : shiftedStart + Math.max(200, rawDur);
       return {
         ...b,
         bIdx,

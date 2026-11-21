@@ -31,6 +31,10 @@ const NON_LATIN_SCRIPT_REGEX =
 
 const SLASH_IPA_REGEX = /(?:^|\s)\/[^/\s]+\/(?:[\s.,!?;:]|$)/;
 
+// Foreign diacritics / umlauts that must NOT leak into English-intuitive phonetics (hyphenated/flowing)
+const INTUITIVE_DIACRITIC_FORBIDDEN_REGEX =
+  /[äöüßéèêëàâçñîïôùûüÿœæÄÖÜÉÈÊËÀÂÇÑÎÏÔÙÛÜŸŒÆ]/;
+
 function getAiClient(): GoogleGenAI {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) {
@@ -77,19 +81,19 @@ export function getLanguagePhoneticRules(
   }
 
   if (lower.includes('german')) {
-    return 'German rules: ch after a/o/u/au = "kh" (ich = "ikh"); sch = "sh"; sp/st at start = "shp/sht"; ei = "eye"; eu/äu = "oy"; ie = "ee"; v = "f"; w = "v"; z = "ts"; final b/d/g devoiced to p/t/k.';
+    return 'German rules (plain ASCII English sounds ONLY — NEVER output ü/ö/ä/ß or German ue/oe): ü = "ew" (München -> MEWN-khen, drüber -> DREW-ber, Tür -> tewr); ö = "eu" (zuhörst -> TSOO-heurst); ä = "eh"; ch after a/o/u/au = "kh" (ich = "ikh"); sch = "sh"; sp/st at start = "shp/sht"; ei = "y"/"igh" (Gleis -> glice, leid -> lyte, Schneider -> SHNY-der — NEVER awkward "leyet"/"gleyes"); eu/äu = "oy"; ie = "ee"; long o = "oh" (schon -> shohn); unstressed ge- = "guh-" (gesagt -> guh-ZAKT); v = "f"; w = "v"; z = "ts"; final b/d/g devoiced to p/t/k.';
   }
   if (lower.includes('japanese')) {
-    return 'Japanese rules: resolve kanji readings from context (never character-by-character substitution); clear moraic syllables (koh-nee-chee-wah); long vowels doubled or marked cleanly (oh, oo, eh); final -u in desu/masu often soft/elided (dess, mahss); particle は="wah", へ="eh", を="oh".';
+    return 'Japanese rules: resolve kanji readings from context (never character-by-character substitution); hyphenate multi-syllable words cleanly (koh-nee-chee-wah) BUT keep grammatical particles (wah, gah, oh, noh, nee, deh, toh, yah) SPACE-SEPARATED from nouns/verbs (e.g., "tah-kah-HAH-shee SAH-mah wah", NEVER giant hyphen chains like "tah-kah-hah-shee-SAH-mah-wah"); long vowels clear (oh, oo, eh); final -u in desu/masu soft/elided (dess, mahss); particle は="wah", へ="eh", を="oh".';
   }
   if (lower.includes('spanish')) {
-    return 'Spanish rules: ll = "y"; ñ = "ny"; j/ge/gi = "kh/h"; qu = "k"; h is silent; soft intervocalic d = light "th/d"; clear vowels (a=ah, e=eh, i=ee, o=oh, u=oo).';
+    return 'Spanish rules: ll = "y"; ñ = "ny"; j/ge/gi = "kh/h"; qu = "k"; h is silent; soft intervocalic d = light "th/d"; clear vowels (a=ah, e=eh, i=ee, o=oh, u=oo). Plain ASCII only (no accents/ñ).';
   }
   if (lower.includes('french')) {
-    return 'French rules: account for spoken liaisons and silent final consonants; nasal vowels written naturally like "oh(n)", "ah(n)", "eh(n)"; u = "ew"; ou = "oo"; j = "zh"; qu = "k".';
+    return 'French rules (plain ASCII only — no accents/ç): account for spoken liaisons and silent final consonants; elide final -e before a following vowel (tombe à l\'eau -> "toh(m)b ah LOH", NOT "toh(m)-buh ah LOH"); nasal vowels written naturally like "oh(n)", "ah(n)", "eh(n)"; -ail/-aille = "y"/"igh" (travail -> "tra-VIGH", NEVER "tra-VAY"); -et/-ais/-ait = "eh" (cabinet -> "ka-bee-NEH", NEVER "ka-bee-NAY"); -o/-eau = "oh" (Moreau -> "mo-ROH"); u = "ew"; ou = "oo"; j = "zh"; qu = "k".';
   }
   if (lower.includes('korean')) {
-    return 'Korean rules: apply batchim consonant assimilation, liaison, and tensification between syllables (never naive jamo-by-jamo substitution); eo = "uh"; eu = "eu"; ae/e = "eh"; si = "shee".';
+    return 'Korean rules (English-intuitive ASCII ONLY — NEVER use Revised Romanization "eo"/"yeo"/"ae"/"oe" in this mode!): eo = "uh" (어=uh, ㅓ=uh), yeo = "yuh", ae/e = "eh", a = "ah", o = "oh", u = "oo", i = "ee", si = "shee". Apply batchim consonant assimilation, nasalization (먹는 -> muhng-NEUN, 감사합니다 -> gahm-sah-hahm-NEE-dah), lateralization (천 리 -> chuhl-LEE, 실례합니다 -> sheel-lyeh-hahm-NEE-dah), liaison (확인해 -> hwah-GEE-neh), and tensification (없다 -> uhp-TTAH). Keep recurring names/words spelled identically across all cues.';
   }
   if (lower.includes('mandarin') || lower.includes('chinese')) {
     return 'Mandarin rules: convert multi-character words contextually into English-intuitive sounds: zh="j", q="ch", x="sh", c="ts", z="dz", ü="ew"; natural syllable breaks.';
@@ -163,7 +167,7 @@ export function buildSystemInstruction(params: {
     '2. Preserve character names, recurring terms, and idiomatic meaning consistently across cues, matching entries in readOnlyConsistencyGlossary.',
     'PHONETIC & OUTPUT RULES (CRITICAL):',
     '3. Keep transliteration/pronunciation ("phoneticText") strictly separate from translation ("baseText").',
-    '4. NEVER output International Phonetic Alphabet (IPA) symbols, slash delimiters (/.../), or non-Latin characters in "phoneticText".',
+    '4. NEVER output International Phonetic Alphabet (IPA) symbols, slash delimiters (/.../), or non-Latin characters in "phoneticText". In hyphenated/flowing English-intuitive modes, use plain ASCII letters only (no foreign diacritics like ü, ö, ä, é, ç, ñ) and spell recurring names/words identically across every cue.',
     `5. ${styleDesc}`,
     `6. ${getLanguagePhoneticRules(params.targetLang, params.phoneticStyle)}`,
     '7. Keep lines concise and faithful to film dialogue without adding commentary or brackets.',
@@ -232,6 +236,7 @@ async function defaultGenerateWithGemini(
 function validateAndNormalizeBatchItems(
   rawText: string,
   batch: BatchInputCue[],
+  phoneticStyle: PhoneticStyle = 'hyphenated',
 ): GeminiBatchItem[] {
   const trimmed = rawText.trim();
   if (!trimmed) {
@@ -280,6 +285,14 @@ function validateAndNormalizeBatchItems(
     if (NON_LATIN_SCRIPT_REGEX.test(rawPhonetic)) {
       throw new Error(`Non-Latin script leaked into phonetic output for cue ${item.index}`);
     }
+    if (
+      phoneticStyle !== 'standard' &&
+      INTUITIVE_DIACRITIC_FORBIDDEN_REGEX.test(rawPhonetic)
+    ) {
+      throw new Error(
+        `Foreign diacritic character leaked into English-intuitive phonetic output for cue ${item.index}`,
+      );
+    }
 
     byIndex.set(item.index, {
       index: item.index,
@@ -320,7 +333,7 @@ function validateAndNormalizeBatchItems(
   });
 }
 
-function isNonRetryableApiError(err: unknown): boolean {
+export function isNonRetryableApiError(err: unknown): boolean {
   const status =
     err && typeof err === 'object' && 'status' in err
       ? Number((err as { status?: unknown }).status)
@@ -329,13 +342,50 @@ function isNonRetryableApiError(err: unknown): boolean {
     return true;
   }
   const msg = err instanceof Error ? err.message : String(err);
-  return (
+  if (
     msg.includes('API_KEY_INVALID') ||
     msg.includes('PERMISSION_DENIED') ||
     msg.includes('UNAUTHENTICATED') ||
     msg.includes('NOT_FOUND') ||
     /\b(?:HTTP|status)\s*[:=]?\s*(?:401|403)\b/i.test(msg)
-  );
+  ) {
+    return true;
+  }
+  // Do not waste retries on daily quota exhaustion (e.g. Free Tier Requests Per Day limit)
+  if (
+    (msg.includes('RESOURCE_EXHAUSTED') || msg.includes('429')) &&
+    /PerDay|requests per day|daily quota/i.test(msg)
+  ) {
+    return true;
+  }
+  return false;
+}
+
+export function formatGeminiErrorMessage(err: unknown): string {
+  const raw = err instanceof Error ? err.message : String(err);
+  const trimmed = raw.trim();
+  if (trimmed.startsWith('{')) {
+    try {
+      const parsed = JSON.parse(trimmed) as {
+        error?: { code?: number; status?: string; message?: string };
+      };
+      if (parsed?.error?.message) {
+        const code = parsed.error.code;
+        const status = parsed.error.status || '';
+        const firstLine = parsed.error.message.split('\n')[0].trim();
+        if (code === 429 || status === 'RESOURCE_EXHAUSTED') {
+          if (/PerDay|requests per day/i.test(parsed.error.message)) {
+            return 'Gemini API daily request quota exceeded (429 RESOURCE_EXHAUSTED). Please try again later or upgrade your API key quota.';
+          }
+          return `Gemini API rate limit reached (429): ${firstLine}`;
+        }
+        return code ? `Gemini API error (${code}): ${firstLine}` : firstLine;
+      }
+    } catch {
+      // Fall through to raw message
+    }
+  }
+  return trimmed || 'Gemini batch processing failed after retries.';
 }
 
 async function callGeminiBatchWithRetry(
@@ -347,6 +397,7 @@ async function callGeminiBatchWithRetry(
   contextBefore: BatchInputCue[],
   contextAfter: BatchInputCue[],
   consistencyGlossary: Array<{ baseText: string; targetText: string; phoneticText: string }>,
+  phoneticStyle: PhoneticStyle = 'hyphenated',
   retryDelayBaseMs = 800,
 ): Promise<GeminiBatchItem[]> {
   const promptPayload = {
@@ -378,12 +429,12 @@ async function callGeminiBatchWithRetry(
         contents: JSON.stringify(promptPayload),
       });
 
-      return validateAndNormalizeBatchItems(rawText, batch);
+      return validateAndNormalizeBatchItems(rawText, batch, phoneticStyle);
     } catch (err: unknown) {
       lastError = err;
-      // Do not retry hard auth/config errors (never match numeric cue indices like 401/403)
+      // Do not retry hard auth/config or daily-quota errors (never match numeric cue indices like 401/403)
       if (isNonRetryableApiError(err)) {
-        throw err;
+        throw new Error(formatGeminiErrorMessage(err));
       }
       if (attempt < MAX_RETRIES - 1 && retryDelayBaseMs > 0) {
         const delayMs =
@@ -393,9 +444,7 @@ async function callGeminiBatchWithRetry(
     }
   }
 
-  throw lastError instanceof Error
-    ? lastError
-    : new Error('Gemini batch processing failed after retries.');
+  throw new Error(formatGeminiErrorMessage(lastError));
 }
 
 export interface ProgressSnapshot {
@@ -494,7 +543,9 @@ export async function processTriLineConversion(params: {
         cached.targetText &&
         cached.phoneticText &&
         !IPA_FORBIDDEN_REGEX.test(cached.phoneticText) &&
-        !NON_LATIN_SCRIPT_REGEX.test(cached.phoneticText)
+        !NON_LATIN_SCRIPT_REGEX.test(cached.phoneticText) &&
+        (params.phoneticStyle === 'standard' ||
+          !INTUITIVE_DIACRITIC_FORBIDDEN_REGEX.test(cached.phoneticText))
       ) {
         const finalBase = cue.baseText.trim() ? cue.baseText : cached.baseText;
         const finalTarget = cue.targetText.trim() ? cue.targetText : cached.targetText;
@@ -608,6 +659,7 @@ export async function processTriLineConversion(params: {
           contextBefore,
           contextAfter,
           glossaryEntries,
+          params.phoneticStyle,
           params.retryDelayBaseMs ?? 800,
         );
       } catch (err: unknown) {
